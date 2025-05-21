@@ -1059,31 +1059,100 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         }
     }
 
-    // pass 4: assign backends to remaining src from dst and view_src
+    // Pass 3.5: Ensure all non-view nodes have a backend assigned.
+    // If a non-view node is still -1, default it to the last backend (CPU).
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
-        int * cur_backend_id = &tensor_backend_id(node);
-        if (node->view_src != NULL && *cur_backend_id == -1) {
-            *cur_backend_id = tensor_backend_id(node->view_src);
-            SET_CAUSE(node, "4.vsrc");
+        if (ggml_is_view_op(node->op)) {
+            continue; // Views will derive from their sources later
         }
+        int * node_backend_id = &tensor_backend_id(node); // macro defined in ggml-backend.cpp
+        if (*node_backend_id == -1) {
+            *node_backend_id = sched->n_backends - 1; // Default to the last backend (assumed CPU)
+            SET_CAUSE(node, "3.5.default_cpu_non_view"); // SET_CAUSE is a debug macro, keep or remove
+        }
+    }
+    // Also ensure leafs that are not views are assigned
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+         if (ggml_is_view_op(leaf->op)) { 
+            continue;
+        }
+        int * leaf_backend_id = &tensor_backend_id(leaf);
+        if (*leaf_backend_id == -1) {
+            *leaf_backend_id = sched->n_backends - 1;
+            SET_CAUSE(leaf, "3.5.default_cpu_leaf");
+        }
+    }
+
+    // Pass 4: assign backends to views and ensure sources are covered
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        int * node_backend_id_ptr = &tensor_backend_id(node);
+        int current_node_resolved_backend_id;
+
+        if (node->view_src != NULL) {
+            // A view's backend is determined by its ultimate non-view source.
+            struct ggml_tensor * ultimate_src = node->view_src;
+            while (ultimate_src->view_src != NULL) {
+                ultimate_src = ultimate_src->view_src;
+            }
+            int ultimate_src_backend_id = tensor_backend_id(ultimate_src);
+            // ultimate_src (non-view) should have been assigned in Pass 3.5 or earlier
+            GGML_ASSERT(ultimate_src_backend_id != -1 && "Ultimate source of view was not assigned a backend"); 
+
+            if (*node_backend_id_ptr == -1 || *node_backend_id_ptr != ultimate_src_backend_id) {
+                *node_backend_id_ptr = ultimate_src_backend_id;
+                SET_CAUSE(node, "4.view_from_ultimate_src");
+            }
+            current_node_resolved_backend_id = ultimate_src_backend_id;
+        } else {
+            // Non-view node, should have been assigned by Pass 3.5
+            GGML_ASSERT(*node_backend_id_ptr != -1 && "Non-view node unassigned after Pass 3.5");
+            current_node_resolved_backend_id = *node_backend_id_ptr;
+        }
+
+        // Assign backends to sources of this node if they are still unassigned
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (src == NULL) {
                 continue;
             }
-            int * src_backend_id = &tensor_backend_id(src);
-            if (*src_backend_id == -1) {
-                if (src->view_src != NULL) {
-                    // views are always on the same backend as the source
-                    *src_backend_id = tensor_backend_id(src->view_src);
-                    SET_CAUSE(src, "4.vsrc");
-                } else {
-                    *src_backend_id = *cur_backend_id;
-                    SET_CAUSE(src, "4.cur");
+            int * src_backend_id_ptr = &tensor_backend_id(src);
+            if (*src_backend_id_ptr == -1) {
+                // If src is a view, it will get its backend when it's processed as 'node'.
+                // If src is not a view and unassigned, it takes the backend of its destination node.
+                if (src->view_src == NULL) { // src is not a view
+                    *src_backend_id_ptr = current_node_resolved_backend_id;
+                    SET_CAUSE(src, "4.src_from_dst");
+                }
+                // If src is a view and unassigned, it will be handled when src itself is 'node'
+            }
+        }
+    }
+    
+    // A final pass to ensure all views are consistent with their (potentially just updated) sources.
+    // This handles cases where a view's source was another view that got its backend updated.
+    for (int iter = 0; iter < GGML_MAX_DIMS; ++iter) { // Iterate a few times to propagate view changes
+        bool changed_in_iteration = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->view_src != NULL) {
+                int * node_backend_id_ptr = &tensor_backend_id(node);
+                struct ggml_tensor * ultimate_src = node->view_src;
+                while (ultimate_src->view_src != NULL) ultimate_src = ultimate_src->view_src;
+                
+                int ultimate_src_backend_id = tensor_backend_id(ultimate_src);
+                GGML_ASSERT(ultimate_src_backend_id != -1 && "View's ultimate source has no backend in final fixup");
+
+                if(*node_backend_id_ptr != ultimate_src_backend_id) {
+                    *node_backend_id_ptr = ultimate_src_backend_id;
+                    SET_CAUSE(node, "4.final_view_fixup");
+                    changed_in_iteration = true;
                 }
             }
         }
+        if (!changed_in_iteration) break;
     }
 
     // pass 5: split graph, find tensors that need to be copied
