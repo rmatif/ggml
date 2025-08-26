@@ -73,6 +73,14 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+#define CUDNN_CHECK(call)                                       \
+    do {                                                        \
+        cudnnStatus_t status = (call);                          \
+        if (status != CUDNN_STATUS_SUCCESS) {                   \
+            ggml_cuda_error(#call, __func__, __FILE__, __LINE__, cudnnGetErrorString(status)); \
+        }                                                       \
+    } while (0)
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -519,6 +527,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+        }
+        if (cudnn_handles[i] != nullptr) {
+            CUDNN_CHECK(cudnnDestroy(cudnn_handles[i]));
         }
     }
 }
@@ -2062,8 +2073,153 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
+static cudnnDataType_t ggml_type_to_cudnn_data_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:  return CUDNN_DATA_FLOAT;
+        case GGML_TYPE_F16:  return CUDNN_DATA_HALF;
+        default: GGML_ABORT("unsupported data type for cuDNN conv2d");
+    }
+}
+
+static cudnnHandle_t get_cudnn_handle(ggml_backend_cuda_context & ctx, int device) {
+    if (ctx.cudnn_handles[device] == nullptr) {
+        ggml_cuda_set_device(device);
+        CUDNN_CHECK(cudnnCreate(&ctx.cudnn_handles[device]));
+    }
+    return ctx.cudnn_handles[device];
+}
+
+static void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * src    = dst->src[1];
+
+    const int S0 = ggml_get_op_params_i32(dst, 0);
+    const int S1 = ggml_get_op_params_i32(dst, 1);
+    const int P0 = ggml_get_op_params_i32(dst, 2);
+    const int P1 = ggml_get_op_params_i32(dst, 3);
+    const int D0 = ggml_get_op_params_i32(dst, 4);
+    const int D1 = ggml_get_op_params_i32(dst, 5);
+
+    int id = ggml_cuda_get_device();
+    cudnnHandle_t cudnn_handle = get_cudnn_handle(ctx, id);
+    cudaStream_t stream = ctx.stream();
+    CUDNN_CHECK(cudnnSetStream(cudnn_handle, stream));
+
+    cudnnTensorDescriptor_t src_desc;
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&src_desc));
+    const int src_dims[] = { (int)src->ne[3], (int)src->ne[2], (int)src->ne[1], (int)src->ne[0] };
+    const int src_strides[] = { (int)(src->nb[3] / ggml_type_size(src->type)), (int)(src->nb[2] / ggml_type_size(src->type)), (int)(src->nb[1] / ggml_type_size(src->type)), (int)(src->nb[0] / ggml_type_size(src->type)) };
+    CUDNN_CHECK(cudnnSetTensorNdDescriptor(src_desc, CUDNN_DATA_FLOAT, 4, src_dims, src_strides));
+
+    cudnnTensorDescriptor_t dst_desc;
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&dst_desc));
+    const int dst_dims[] = { (int)dst->ne[3], (int)dst->ne[2], (int)dst->ne[1], (int)dst->ne[0] };
+    const int dst_strides[] = { (int)(dst->nb[3] / ggml_type_size(dst->type)), (int)(dst->nb[2] / ggml_type_size(dst->type)), (int)(dst->nb[1] / ggml_type_size(dst->type)), (int)(dst->nb[0] / ggml_type_size(dst->type)) };
+    CUDNN_CHECK(cudnnSetTensorNdDescriptor(dst_desc, CUDNN_DATA_FLOAT, 4, dst_dims, dst_strides));
+
+    cudnnConvolutionDescriptor_t conv_desc;
+    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
+    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc, P1, P0, S1, S0, D1, D0, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    CUDNN_CHECK(cudnnSetConvolutionGroupCount(conv_desc, 1));
+
+    const void * final_kernel_ptr = kernel->data;
+    cudnnDataType_t final_kernel_type = ggml_type_to_cudnn_data_type(kernel->type);
+    cudnnMathType_t final_math_type = CUDNN_DEFAULT_MATH;
+    cudnnConvolutionFwdAlgo_t final_algo;
+    size_t final_workspace_size = 0;
+    bool algo_found = false;
+
+    ggml_cuda_pool_alloc<float> kernel_f32_pool(ctx.pool(id));
+
+    if (kernel->type == GGML_TYPE_F16) {
+        cudnnFilterDescriptor_t kernel_desc_f16;
+        CUDNN_CHECK(cudnnCreateFilterDescriptor(&kernel_desc_f16));
+        const int kernel_dims[] = { (int)kernel->ne[3], (int)kernel->ne[2], (int)kernel->ne[1], (int)kernel->ne[0] };
+        CUDNN_CHECK(cudnnSetFilterNdDescriptor(kernel_desc_f16, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, 4, kernel_dims));
+
+        cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+        int returned_algo_count = 0;
+
+        for (int i = 0; i < 2 && !algo_found; ++i) {
+            cudnnMathType_t math_type = (i == 0) ? CUDNN_TENSOR_OP_MATH : CUDNN_DEFAULT_MATH;
+            CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, math_type));
+            cudnnStatus_t status_algo = cudnnGetConvolutionForwardAlgorithm_v7(cudnn_handle,
+                src_desc, kernel_desc_f16, conv_desc, dst_desc,
+                1, &returned_algo_count, perf_results);
+
+            if (status_algo == CUDNN_STATUS_SUCCESS && returned_algo_count > 0) {
+                size_t workspace_size = 0;
+                cudnnStatus_t status_ws = cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle,
+                    src_desc, kernel_desc_f16, conv_desc, dst_desc, perf_results[0].algo, &workspace_size);
+                if (status_ws == CUDNN_STATUS_SUCCESS) {
+                    final_algo = perf_results[0].algo;
+                    final_workspace_size = workspace_size;
+                    final_math_type = math_type;
+                    algo_found = true;
+                }
+            }
+        }
+        CUDNN_CHECK(cudnnDestroyFilterDescriptor(kernel_desc_f16));
+    }
+
+    if (!algo_found) {
+        final_math_type = CUDNN_DEFAULT_MATH;
+        if (kernel->type == GGML_TYPE_F16) {
+            kernel_f32_pool.alloc(ggml_nelements(kernel));
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            to_fp32_cuda(kernel->data, kernel_f32_pool.get(), ggml_nelements(kernel), stream);
+            final_kernel_ptr = kernel_f32_pool.get();
+        }
+        final_kernel_type = CUDNN_DATA_FLOAT;
+
+        cudnnFilterDescriptor_t kernel_desc_f32;
+        CUDNN_CHECK(cudnnCreateFilterDescriptor(&kernel_desc_f32));
+        const int kernel_dims[] = { (int)kernel->ne[3], (int)kernel->ne[2], (int)kernel->ne[1], (int)kernel->ne[0] };
+        CUDNN_CHECK(cudnnSetFilterNdDescriptor(kernel_desc_f32, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, kernel_dims));
+        CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
+
+        cudnnConvolutionFwdAlgoPerf_t perf_results[1];
+        int returned_algo_count;
+        CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(cudnn_handle,
+            src_desc, kernel_desc_f32, conv_desc, dst_desc,
+            1, &returned_algo_count, perf_results));
+        if (returned_algo_count == 0) {
+            GGML_ABORT("cuDNN could not find a suitable algorithm for F32 conv2d");
+        }
+        final_algo = perf_results[0].algo;
+        CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle,
+            src_desc, kernel_desc_f32, conv_desc, dst_desc, final_algo, &final_workspace_size));
+        CUDNN_CHECK(cudnnDestroyFilterDescriptor(kernel_desc_f32));
+    }
+
+    CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, final_math_type));
+
+    cudnnFilterDescriptor_t final_kernel_desc;
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&final_kernel_desc));
+    const int kernel_dims[] = { (int)kernel->ne[3], (int)kernel->ne[2], (int)kernel->ne[1], (int)kernel->ne[0] };
+    CUDNN_CHECK(cudnnSetFilterNdDescriptor(final_kernel_desc, final_kernel_type, CUDNN_TENSOR_NCHW, 4, kernel_dims));
+
+    ggml_cuda_pool_alloc<char> workspace(ctx.pool(id));
+    if (final_workspace_size > 0) {
+        workspace.alloc(final_workspace_size);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    CUDNN_CHECK(cudnnConvolutionForward(cudnn_handle,
+        &alpha, src_desc, src->data,
+        final_kernel_desc, final_kernel_ptr,
+        conv_desc, final_algo, workspace.get(), final_workspace_size,
+        &beta, dst_desc, dst->data));
+
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(src_desc));
+    CUDNN_CHECK(cudnnDestroyFilterDescriptor(final_kernel_desc));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(dst_desc));
+    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
+}
+
+static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {    const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
@@ -2428,6 +2584,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_IM2COL:
             ggml_cuda_op_im2col(ctx, dst);
+            break;
+        case GGML_OP_CONV_2D:
+            ggml_cuda_op_conv2d(ctx, dst);
             break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
@@ -3479,6 +3638,42 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
         case GGML_OP_IM2COL:
+            return true;
+        case GGML_OP_CONV_2D:
+            {
+                const ggml_tensor * kernel = op->src[0];
+                const ggml_tensor * src = op->src[1];
+
+                if (src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (kernel->type != GGML_TYPE_F32 && kernel->type != GGML_TYPE_F16) {
+                    return false;
+                }
+
+                if (!ggml_is_contiguous(src) || !ggml_is_contiguous(kernel)) {
+                    return false;
+                }
+
+                const int P0 = ggml_get_op_params_i32(op, 2);
+                const int P1 = ggml_get_op_params_i32(op, 3);
+                const int D0 = ggml_get_op_params_i32(op, 4);
+                const int D1 = ggml_get_op_params_i32(op, 5);
+
+                const int64_t W = src->ne[0];
+                const int64_t H = src->ne[1];
+                const int64_t KW = kernel->ne[0];
+                const int64_t KH = kernel->ne[1];
+
+                if (W + 2LL * P0 < (long long)D0 * (KW - 1) + 1) {
+                    return false;
+                }
+                if (H + 2LL * P1 < (long long)D1 * (KH - 1) + 1) {
+                    return false;
+                }
+
+                return true;
+            }
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_2D:

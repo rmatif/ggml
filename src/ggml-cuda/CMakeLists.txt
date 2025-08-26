@@ -1,6 +1,27 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
-find_package(CUDAToolkit)
+find_package(CUDAToolkit REQUIRED)
+
+# --- Manual cuDNN Find ---
+# Stop relying on find_package for CUDNN as it's failing in this environment.
+# Instead, manually find the header and library files in the standard paths we've confirmed.
+find_path(CUDNN_INCLUDE_DIR cudnn.h
+          HINTS /usr/include ${CUDAToolkit_INCLUDE_DIRS})
+
+find_library(CUDNN_LIBRARY cudnn
+             HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 ${CUDAToolkit_LIBRARY_DIR})
+
+if(NOT CUDNN_INCLUDE_DIR OR NOT CUDNN_LIBRARY)
+    message(FATAL_ERROR "Could not find cuDNN header or library manually. \n"
+                        "  CUDNN_INCLUDE_DIR: ${CUDNN_INCLUDE_DIR} \n"
+                        "  CUDNN_LIBRARY: ${CUDNN_LIBRARY}")
+else()
+    message(STATUS "Found cuDNN header in: ${CUDNN_INCLUDE_DIR}")
+    message(STATUS "Found cuDNN library: ${CUDNN_LIBRARY}")
+    set(CUDNN_LIBRARIES ${CUDNN_LIBRARY})
+    set(CUDNN_INCLUDE_DIRS ${CUDNN_INCLUDE_DIR})
+endif()
+# --- End Manual cuDNN Find ---
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
@@ -69,6 +90,8 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    target_include_directories(ggml-cuda PRIVATE ${CUDNN_INCLUDE_DIRS})
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
@@ -102,12 +125,12 @@ if (CUDAToolkit_FOUND)
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas ${CUDNN_LIBRARIES})
         else ()
-            target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static)
+            target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static ${CUDNN_LIBRARIES})
         endif()
     else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas ${CUDNN_LIBRARIES})
     endif()
 
     if (GGML_CUDA_NO_VMM)
