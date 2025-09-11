@@ -33,6 +33,8 @@
 #include "vendors/musa.h"
 #else
 #include "vendors/cuda.h"
+#include <cudnn.h>
+
 #endif // defined(GGML_USE_HIP)
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
@@ -965,6 +967,7 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    cudnnHandle_t  cudnn_handles[GGML_CUDA_MAX_DEVICES]  = {nullptr};
 
     std::unique_ptr<ggml_cuda_graph> cuda_graph;
 
