@@ -74,6 +74,38 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include <tuple>
+
+#if defined(GGML_USE_CUDNN)
+
+namespace fe = cudnn_frontend;
+
+// cache for cuDNN SDPA graphs
+struct ggml_cudnn_sdpa_key {
+    int64_t b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v;
+    std::array<int64_t, 4> q_strides, k_strides, v_strides, o_strides;
+    float attn_scale;
+    bool is_causal;
+
+    bool operator<(const ggml_cudnn_sdpa_key& other) const {
+        return std::tie(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v,
+                        attn_scale, is_causal,
+                        q_strides, k_strides, v_strides, o_strides) <
+               std::tie(other.b, other.h_q, other.h_k, other.h_v, other.s_q, other.s_kv, other.d_qk, other.d_v,
+                        other.attn_scale, other.is_causal,
+                        other.q_strides, other.k_strides, other.v_strides, other.o_strides);
+    }
+};
+
+struct ggml_cudnn_graph_cache_value {
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t workspace_size = 0;
+};
+
+static std::map<ggml_cudnn_sdpa_key, ggml_cudnn_graph_cache_value> s_cudnn_sdpa_graph_cache;
+static std::mutex s_cudnn_sdpa_graph_cache_mutex;
+
+#endif // GGML_USE_CUDNN
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2572,6 +2604,286 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+#if defined(GGML_USE_CUDNN)
+// UIDs for variant pack
+#define Q_UID 1
+#define K_UID 2
+#define V_UID 3
+#define O_UID 4
+
+static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
+                                           ggml_tensor * dst,
+                                           bool is_causal) {
+    namespace fe = cudnn_frontend;
+
+    if (getenv("GGML_CUDA_CUDNN_LOG")) {
+        fe::isLoggingEnabled() = true;
+    }
+
+    if (cudnnGetVersion() < 8903) {
+        // SDPA is available from cuDNN 8.9.3+ in graphs.
+        return false;
+    }
+
+    GGML_LOG_INFO("%s: using cuDNN flash attention\n", __func__);
+
+    // --- Inputs ---
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    const ggml_tensor * q_cont = q;
+    const ggml_tensor * k_cont = k;
+    const ggml_tensor * v_cont = v;
+
+    struct ggml_tensor q_tmp, k_tmp, v_tmp;
+
+    // Duplicate to a contiguous row layout if nb0 != type_size
+    ggml_cuda_pool_alloc<char> q_cont_pool(ctx.pool());
+    if (q->nb[0] != ggml_type_size(q->type)) {
+        q_tmp      = *q;
+        q_tmp.src[0] = (ggml_tensor *)q;
+        q_tmp.data   = q_cont_pool.alloc(ggml_nbytes(q));
+        ggml_cuda_dup(ctx, &q_tmp);
+        q_cont = &q_tmp;
+    }
+
+    ggml_cuda_pool_alloc<char> k_cont_pool(ctx.pool());
+    if (k->nb[0] != ggml_type_size(k->type)) {
+        k_tmp      = *k;
+        k_tmp.src[0] = (ggml_tensor *)k;
+        k_tmp.data   = k_cont_pool.alloc(ggml_nbytes(k));
+        ggml_cuda_dup(ctx, &k_tmp);
+        k_cont = &k_tmp;
+    }
+
+    ggml_cuda_pool_alloc<char> v_cont_pool(ctx.pool());
+    if (v->nb[0] != ggml_type_size(v->type)) {
+        v_tmp      = *v;
+        v_tmp.src[0] = (ggml_tensor *)v;
+        v_tmp.data   = v_cont_pool.alloc(ggml_nbytes(v));
+        ggml_cuda_dup(ctx, &v_tmp);
+        v_cont = &v_tmp;
+    }
+
+    // --- Shapes (match CPU impl semantics) ---
+    const int64_t d_v  = dst->ne[0];     // DV
+    const int64_t h_q  = dst->ne[1];     // #heads for Q
+    const int64_t s_q  = dst->ne[2];     // sequence length Q
+    const int64_t b    = dst->ne[3];     // batch
+
+    const int64_t d_qk = q_cont->ne[0];  // DK
+    const int64_t s_kv = k_cont->ne[1];  // sequence length KV
+    const int64_t h_k  = k_cont->ne[2];  // #heads for K
+    const int64_t h_v  = v_cont->ne[2];  // #heads for V
+
+    // --- Scale / softcap (mirror CPU path) ---
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;    // currently unused in this path
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        // CPU does: scale /= logit_softcap
+        scale /= logit_softcap;  // keep numerical parity with CPU reference. :contentReference[oaicite:3]{index=3}
+    }
+
+    // Output layout: make O contiguous in (d, h, s, b) order so we can
+    // convert FP16->FP32 directly into dst, which already uses that layout.
+    const int64_t o_stride_d = 1;
+    const int64_t o_stride_h = d_v;
+    const int64_t o_stride_s = h_q * d_v;
+    const int64_t o_stride_b = s_q * h_q * d_v;
+
+    // --- Streams / cuDNN handle ---
+    cudaStream_t  stream       = ctx.stream();
+    cudnnHandle_t cudnn_handle = get_cudnn_handle(ctx, ctx.device);
+    // Ensure cuDNN runs on the same stream as all conversions to avoid
+    // races across back-to-back test cases.
+    cudnnSetStream(cudnn_handle, stream);
+
+    // --- Convert to FP16 if needed (cuDNN SDPA I/O is FP16 here) ---
+    const bool q_duplicated = (q->nb[0] != ggml_type_size(q->type));
+    const bool k_duplicated = (k->nb[0] != ggml_type_size(k->type));
+    const bool v_duplicated = (v->nb[0] != ggml_type_size(v->type));
+
+    ggml_cuda_pool_alloc<half> q_f16_pool(ctx.pool());
+    ggml_cuda_pool_alloc<half> k_f16_pool(ctx.pool());
+    ggml_cuda_pool_alloc<half> v_f16_pool(ctx.pool());
+
+    void * q_ptr = q_cont->data;
+    void * k_ptr = k_cont->data;
+    void * v_ptr = v_cont->data;
+
+    bool q_converted = false;
+    bool k_converted = false;
+    bool v_converted = false;
+
+    if (q_cont->type == GGML_TYPE_F32)   { q_ptr = q_f16_pool.alloc(ggml_nelements(q_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_F32)(q_cont->data, (half *)q_ptr, ggml_nelements(q_cont), stream); q_converted = true; }
+    else if (q_cont->type == GGML_TYPE_BF16) { q_ptr = q_f16_pool.alloc(ggml_nelements(q_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_BF16)(q_cont->data, (half *)q_ptr, ggml_nelements(q_cont), stream); q_converted = true; }
+
+    if (k_cont->type == GGML_TYPE_F32)   { k_ptr = k_f16_pool.alloc(ggml_nelements(k_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_F32)(k_cont->data, (half *)k_ptr, ggml_nelements(k_cont), stream); k_converted = true; }
+    else if (k_cont->type == GGML_TYPE_BF16) { k_ptr = k_f16_pool.alloc(ggml_nelements(k_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_BF16)(k_cont->data, (half *)k_ptr, ggml_nelements(k_cont), stream); k_converted = true; }
+
+    if (v_cont->type == GGML_TYPE_F32)   { v_ptr = v_f16_pool.alloc(ggml_nelements(v_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_F32)(v_cont->data, (half *)v_ptr, ggml_nelements(v_cont), stream); v_converted = true; }
+    else if (v_cont->type == GGML_TYPE_BF16) { v_ptr = v_f16_pool.alloc(ggml_nelements(v_cont)); ggml_get_to_fp16_cuda(GGML_TYPE_BF16)(v_cont->data, (half *)v_ptr, ggml_nelements(v_cont), stream); v_converted = true; }
+
+    // Strides in elements for Q/K/V. If we converted or duplicated, they are dense
+    // in (b, h, s, d) with the obvious row-major strides; otherwise derive from nb[].
+    std::array<int64_t, 4> q_strides;
+    std::array<int64_t, 4> k_strides;
+    std::array<int64_t, 4> v_strides;
+
+    if (q_converted || q_duplicated) {
+        q_strides = { h_q * s_q * d_qk, s_q * d_qk, d_qk, 1 };
+    } else {
+        q_strides = { (int64_t)(q_cont->nb[3]/sizeof(ggml_fp16_t)),
+                      (int64_t)(q_cont->nb[2]/sizeof(ggml_fp16_t)),
+                      (int64_t)(q_cont->nb[1]/sizeof(ggml_fp16_t)), 1 };
+    }
+
+    if (k_converted || k_duplicated) {
+        k_strides = { h_k * s_kv * d_qk, s_kv * d_qk, d_qk, 1 };
+    } else {
+        k_strides = { (int64_t)(k_cont->nb[3]/sizeof(ggml_fp16_t)),
+                      (int64_t)(k_cont->nb[2]/sizeof(ggml_fp16_t)),
+                      (int64_t)(k_cont->nb[1]/sizeof(ggml_fp16_t)), 1 };
+    }
+
+    if (v_converted || v_duplicated) {
+        v_strides = { h_v * s_kv * d_v, s_kv * d_v, d_v, 1 };
+    } else {
+        v_strides = { (int64_t)(v_cont->nb[3]/sizeof(ggml_fp16_t)),
+                      (int64_t)(v_cont->nb[2]/sizeof(ggml_fp16_t)),
+                      (int64_t)(v_cont->nb[1]/sizeof(ggml_fp16_t)), 1 };
+    }
+
+    // --- cuDNN graph: reuse cached plan keyed by shape/strides/scale/causal ---
+    struct ggml_cudnn_sdpa_key {
+        int64_t b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v;
+        std::array<int64_t, 4> q_strides, k_strides, v_strides, o_strides;
+        float attn_scale;
+        bool  is_causal;
+        bool operator<(const ggml_cudnn_sdpa_key& other) const {
+            return std::tie(b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v,
+                            attn_scale, is_causal,
+                            q_strides, k_strides, v_strides, o_strides) <
+                   std::tie(other.b, other.h_q, other.h_k, other.h_v,
+                            other.s_q, other.s_kv, other.d_qk, other.d_v,
+                            other.attn_scale, other.is_causal,
+                            other.q_strides, other.k_strides, other.v_strides, other.o_strides);
+        }
+    };
+    struct ggml_cudnn_graph_cache_value {
+        std::shared_ptr<fe::graph::Graph> graph;
+        int64_t workspace_size = 0;
+    };
+    static std::map<ggml_cudnn_sdpa_key, ggml_cudnn_graph_cache_value> s_cudnn_sdpa_graph_cache;
+    static std::mutex s_cudnn_sdpa_graph_cache_mutex;
+
+    ggml_cudnn_sdpa_key key = {
+        b, h_q, h_k, h_v, s_q, s_kv, d_qk, d_v,
+        q_strides, k_strides, v_strides,
+        { o_stride_b, o_stride_h, o_stride_s, o_stride_d },  // note: cuDNN expects {B,H,S,D}
+        scale, is_causal
+    };
+
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t workspace_size = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(s_cudnn_sdpa_graph_cache_mutex);
+        auto it = s_cudnn_sdpa_graph_cache.find(key);
+        if (it != s_cudnn_sdpa_graph_cache.end()) {
+            graph          = it->second.graph;
+            workspace_size = it->second.workspace_size;
+        } else {
+            auto new_graph = std::make_shared<fe::graph::Graph>();
+            new_graph->set_io_data_type(fe::DataType_t::HALF)
+                     .set_intermediate_data_type(fe::DataType_t::FLOAT)
+                     .set_compute_data_type(fe::DataType_t::FLOAT);
+
+            auto Q = new_graph->tensor(fe::graph::Tensor_attributes()
+                        .set_uid(Q_UID)
+                        .set_dim({b, h_q, s_q, d_qk})
+                        .set_stride({key.q_strides[0], key.q_strides[1],
+                                     key.q_strides[2], key.q_strides[3]}));
+
+            auto K = new_graph->tensor(fe::graph::Tensor_attributes()
+                        .set_uid(K_UID)
+                        .set_dim({b, h_k, s_kv, d_qk})
+                        .set_stride({key.k_strides[0], key.k_strides[1],
+                                     key.k_strides[2], key.k_strides[3]}));
+
+            auto V = new_graph->tensor(fe::graph::Tensor_attributes()
+                        .set_uid(V_UID)
+                        .set_dim({b, h_v, s_kv, d_v})
+                        .set_stride({key.v_strides[0], key.v_strides[1],
+                                     key.v_strides[2], key.v_strides[3]}));
+
+            auto sdpa_options = fe::graph::SDPA_attributes()
+                                    .set_generate_stats(false)
+                                    .set_attn_scale(scale);
+            if (is_causal) {
+                // causal masking via the graph SDPA attribute (supported in cuDNN graphs). :contentReference[oaicite:4]{index=4}
+                sdpa_options.set_causal_mask(true);
+            }
+
+            auto [O, Stats] = new_graph->sdpa(Q, K, V, sdpa_options);
+            O->set_output(true).set_uid(O_UID)
+             .set_dim({b, h_q, s_q, d_v})
+             .set_stride({key.o_strides[0], key.o_strides[1],
+                          key.o_strides[2], key.o_strides[3]});
+
+            auto build_status = new_graph->build(cudnn_handle, {fe::HeurMode_t::B});
+            if (!build_status.is_good()) {
+                GGML_LOG_WARN("%s: cuDNN graph build failed: %s\n",
+                              __func__, build_status.get_message().c_str());
+                return false;
+            }
+
+            auto workspace_status = new_graph->get_workspace_size(workspace_size);
+            if (!workspace_status.is_good()) {
+                GGML_LOG_WARN("%s: cuDNN get_workspace_size failed: %s\n",
+                              __func__, workspace_status.get_message().c_str());
+                return false;
+            }
+
+            s_cudnn_sdpa_graph_cache[key] = {new_graph, workspace_size};
+            graph = std::move(new_graph);
+        }
+    }
+
+    // --- Execute ---
+    ggml_cuda_pool_alloc<half>   dst_f16_pool(ctx.pool());
+    void * o_ptr = dst_f16_pool.alloc(ggml_nelements(dst));  // O is FP16
+
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {Q_UID, q_ptr}, {K_UID, k_ptr}, {V_UID, v_ptr}, {O_UID, o_ptr}
+    };
+
+    ggml_cuda_pool_alloc<int8_t> workspace(ctx.pool(), workspace_size);
+    auto execute_status = graph->execute(cudnn_handle, variant_pack, workspace.get());
+    if (!execute_status.is_good()) {
+        GGML_LOG_WARN("%s: cuDNN graph execute failed: %s\n",
+                      __func__, execute_status.get_message().c_str());
+        return false;
+    }
+
+    // Convert O (FP16, in (d,h,s,b) layout) -> dst (FP32, same layout)
+    const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+    to_fp32_cuda((const half *)o_ptr, (float *)dst->data, ggml_nelements(dst), stream);
+
+    // Ensure all queued work is done before the pooled temporaries go out of scope.
+    // This prevents reuse of Q/K/V/O/workspace buffers while kernels are still in flight.
+    cudaStreamSynchronize(stream);
+
+    return true;
+}
+
+#endif // GGML_USE_CUDNN
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // why is this here instead of mul_mat?
     if (dst->src[0] != nullptr && ggml_backend_buft_is_cuda_split(dst->src[0]->buffer->buft)) {
@@ -2861,7 +3173,29 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+            {
+#if defined(GGML_USE_CUDNN)
+                const char *env = getenv("GGML_CUDNN_FLASH_ATTN");
+                if (env != nullptr) {
+                    const ggml_tensor * q = dst->src[0];
+                    const ggml_tensor * k = dst->src[1];
+                    const ggml_tensor * v = dst->src[2];
+                    const ggml_tensor * mask = dst->src[3];
+
+                    if (!ggml_is_quantized(q->type) && !ggml_is_quantized(k->type) && !ggml_is_quantized(v->type) && mask == nullptr && dst->src[4] == nullptr) {
+                        bool is_causal = (strcmp(env, "causal") == 0);
+                        if (ggml_cuda_flash_attn_ext_cudnn(ctx, dst, is_causal)) {
+                            break;
+                        }
+                        GGML_LOG_ERROR(
+                            "%s: cuDNN Flash Attention failed. For more information, run with GGML_CUDA_CUDNN_LOG=1 and/or CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr.\n",
+                            __func__);
+                        GGML_ABORT("cuDNN Flash Attention failed.");
+                    }
+                }
+#endif // GGML_USE_CUDNN
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);

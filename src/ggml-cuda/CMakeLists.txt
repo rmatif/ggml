@@ -23,6 +23,16 @@ else()
 endif()
 # --- End Manual cuDNN Find ---
 
+# --- Find cuDNN Frontend ---
+find_path(CUDNN_FRONTEND_INCLUDE_DIR cudnn_frontend.h
+          HINTS /work/cudnn-frontend/include)
+
+if(NOT CUDNN_FRONTEND_INCLUDE_DIR)
+    message(FATAL_ERROR "Could not find cudnn_frontend.h. Please ensure cuDNN Frontend is installed in /work/cudnn-frontend or specify its include directory.")
+else()
+    message(STATUS "Found cuDNN Frontend headers in: ${CUDNN_FRONTEND_INCLUDE_DIR}")
+endif()
+
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
@@ -91,8 +101,12 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-    target_include_directories(ggml-cuda PRIVATE ${CUDNN_INCLUDE_DIRS})
+    target_include_directories(ggml-cuda PRIVATE ${CUDNN_INCLUDE_DIRS} ${CUDNN_FRONTEND_INCLUDE_DIR})
 
+    set_target_properties(ggml-cuda PROPERTIES CUDA_STANDARD 17)
+
+    add_compile_definitions(GGML_USE_CUDNN)
+    
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
