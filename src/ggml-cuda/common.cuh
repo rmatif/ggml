@@ -36,6 +36,7 @@
 #else
 #include "vendors/cuda.h"
 #include <cudnn.h>
+#include <cudnn_frontend.h>
 
 #endif // defined(GGML_USE_HIP)
 
