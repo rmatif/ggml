@@ -2328,132 +2328,201 @@ static void ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tens
     const int D0 = ggml_get_op_params_i32(dst, 4);
     const int D1 = ggml_get_op_params_i32(dst, 5);
 
-    int id = ggml_cuda_get_device();
+    const int id = ggml_cuda_get_device();
     cudnnHandle_t cudnn_handle = get_cudnn_handle(ctx, id);
     cudaStream_t stream = ctx.stream();
     CUDNN_CHECK(cudnnSetStream(cudnn_handle, stream));
 
-    const void * src_data = src->data;
-    void * dst_data = dst->data;
-    cudnnDataType_t src_cudnn_type = ggml_type_to_cudnn_data_type(src->type);
-    cudnnDataType_t dst_cudnn_type = ggml_type_to_cudnn_data_type(dst->type);
-    cudnnDataType_t compute_type;
-    cudnnMathType_t math_type;
+    if (getenv("GGML_CUDA_CUDNN_LOG")) {
+        fe::isLoggingEnabled() = true;
+    }
+
+    constexpr int64_t X_UID = 101;
+    constexpr int64_t W_UID = 102;
+    constexpr int64_t Y_UID = 103;
+
+    const bool needs_fp16_path = src->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F16;
+    const bool convert_output_to_fp32 = needs_fp16_path && dst->type == GGML_TYPE_F32;
 
     ggml_cuda_pool_alloc<half> src_f16_pool(ctx.pool(id));
     ggml_cuda_pool_alloc<half> dst_f16_pool(ctx.pool(id));
 
-    if (src->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F16) {
+    const void * x_ptr = src->data;
+    void * y_ptr = dst->data;
+
+    if (needs_fp16_path) {
         src_f16_pool.alloc(ggml_nelements(src));
         const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
         to_fp16_cuda(src->data, src_f16_pool.get(), ggml_nelements(src), stream);
 
-        dst_f16_pool.alloc(ggml_nelements(dst));
-
-        src_data = src_f16_pool.get();
-        dst_data = dst_f16_pool.get();
-        src_cudnn_type = CUDNN_DATA_HALF;
-        dst_cudnn_type = CUDNN_DATA_HALF;
-        math_type = CUDNN_TENSOR_OP_MATH;
-        compute_type = CUDNN_DATA_HALF;
-    } else {
-        math_type = CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION;
-        compute_type = CUDNN_DATA_FLOAT;
-    }
-
-    cudnnTensorDescriptor_t src_desc;
-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&src_desc));
-    const int src_dims[] = { (int)src->ne[3], (int)src->ne[2], (int)src->ne[1], (int)src->ne[0] };
-    const int src_strides[] = { (int)(src->nb[3] / ggml_type_size(src->type)), (int)(src->nb[2] / ggml_type_size(src->type)), (int)(src->nb[1] / ggml_type_size(src->type)), (int)(src->nb[0] / ggml_type_size(src->type)) };
-    CUDNN_CHECK(cudnnSetTensorNdDescriptor(src_desc, src_cudnn_type, 4, src_dims, src_strides));
-
-    cudnnTensorDescriptor_t dst_desc;
-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&dst_desc));
-    const int dst_dims[] = { (int)dst->ne[3], (int)dst->ne[2], (int)dst->ne[1], (int)dst->ne[0] };
-    const int dst_strides[] = { (int)(dst->nb[3] / ggml_type_size(dst->type)), (int)(dst->nb[2] / ggml_type_size(dst->type)), (int)(dst->nb[1] / ggml_type_size(dst->type)), (int)(dst->nb[0] / ggml_type_size(dst->type)) };
-    CUDNN_CHECK(cudnnSetTensorNdDescriptor(dst_desc, dst_cudnn_type, 4, dst_dims, dst_strides));
-
-    cudnnFilterDescriptor_t kernel_desc;
-    CUDNN_CHECK(cudnnCreateFilterDescriptor(&kernel_desc));
-    const int kernel_dims[] = { (int)kernel->ne[3], (int)kernel->ne[2], (int)kernel->ne[1], (int)kernel->ne[0] };
-    CUDNN_CHECK(cudnnSetFilterNdDescriptor(kernel_desc, ggml_type_to_cudnn_data_type(kernel->type), CUDNN_TENSOR_NCHW, 4, kernel_dims));
-
-    cudnnConvolutionDescriptor_t conv_desc;
-    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
-    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc, P1, P0, S1, S0, D1, D0, CUDNN_CROSS_CORRELATION, compute_type));
-    CUDNN_CHECK(cudnnSetConvolutionGroupCount(conv_desc, 1));
-    CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, math_type));
-
-    bool algo_found = false;
-    cudnnConvolutionFwdAlgo_t final_algo;
-    size_t final_workspace_size = 0;
-    long algo_idx = 1L;
-
-    const char* algo_env = getenv("GGML_CUDNN_CONV_ALGO");
-    if (algo_env != nullptr) {
-        char *end;
-        long algo_idx_env = strtol(algo_env, &end, 10);
-        if (*end == '\0' && algo_idx_env >= 0 && algo_idx_env < CUDNN_CONVOLUTION_FWD_ALGO_COUNT) {
-            algo_idx = algo_idx_env;
-        } else {
-            GGML_LOG_WARN("%s: Invalid value for GGML_CUDNN_CONV_ALGO: '%s'. Using default algo %ld. Should be an integer from 0 to %d.\n", __func__, algo_env, algo_idx, CUDNN_CONVOLUTION_FWD_ALGO_COUNT - 1);
+        x_ptr = src_f16_pool.get();
+        if (convert_output_to_fp32) {
+            dst_f16_pool.alloc(ggml_nelements(dst));
+            y_ptr = dst_f16_pool.get();
         }
     }
 
-    final_algo = (cudnnConvolutionFwdAlgo_t)algo_idx;
-    cudnnStatus_t status = cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle, src_desc, kernel_desc, conv_desc, dst_desc, final_algo, &final_workspace_size);
-
-    if (status == CUDNN_STATUS_SUCCESS) {
-        algo_found = true;
-    } else {
-        (void)cudaGetLastError();
-        if (status == CUDNN_STATUS_NOT_SUPPORTED) {
-            GGML_LOG_WARN("%s: cuDNN algorithm %ld is not supported for this problem, falling back to automatic selection.\n", __func__, algo_idx);
-        } else {
-            GGML_LOG_WARN("%s: cudnnGetConvolutionForwardWorkspaceSize failed with %s for algorithm %ld, falling back to automatic selection.\n", __func__, cudnnGetErrorString(status), algo_idx);
+    auto ggml_type_to_fe_type = [](ggml_type type) {
+        switch (type) {
+            case GGML_TYPE_F16: return fe::DataType_t::HALF;
+            case GGML_TYPE_F32: return fe::DataType_t::FLOAT;
+            default: GGML_ABORT("unsupported data type for cuDNN conv2d graph");
         }
-    }
+    };
 
-    if (!algo_found) {
-        int returned_algo_count = 0;
-        cudnnConvolutionFwdAlgoPerf_t perf_results[8];
-        CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(cudnn_handle, src_desc, kernel_desc, conv_desc, dst_desc, 8, &returned_algo_count, perf_results));
+    const fe::DataType_t x_data_type = needs_fp16_path ? fe::DataType_t::HALF : ggml_type_to_fe_type(src->type);
+    const fe::DataType_t w_data_type = ggml_type_to_fe_type(kernel->type);
+    const fe::DataType_t y_data_type = convert_output_to_fp32 ? fe::DataType_t::HALF : ggml_type_to_fe_type(dst->type);
+    const fe::DataType_t compute_data_type = fe::DataType_t::HALF;
 
-        for (int i = 0; i < returned_algo_count; ++i) {
-            if (perf_results[i].status == CUDNN_STATUS_SUCCESS) {
-                final_algo = perf_results[i].algo;
-                final_workspace_size = perf_results[i].memory;
-                algo_found = true;
-                break;
+    const std::array<int64_t, 4> x_dims = { (int64_t)src->ne[3], (int64_t)src->ne[2], (int64_t)src->ne[1], (int64_t)src->ne[0] };
+    const std::array<int64_t, 4> w_dims = { (int64_t)kernel->ne[3], (int64_t)kernel->ne[2], (int64_t)kernel->ne[1], (int64_t)kernel->ne[0] };
+    const std::array<int64_t, 4> y_dims = { (int64_t)dst->ne[3], (int64_t)dst->ne[2], (int64_t)dst->ne[1], (int64_t)dst->ne[0] };
+
+    auto default_nchw_strides = [](const std::array<int64_t, 4> & dims) {
+        std::array<int64_t, 4> strides;
+        strides[3] = 1;
+        strides[2] = dims[3] * strides[3];
+        strides[1] = dims[2] * strides[2];
+        strides[0] = dims[1] * strides[1];
+        return strides;
+    };
+
+    auto strides_from_tensor = [](const ggml_tensor * t, size_t element_size) {
+        return std::array<int64_t, 4> {
+            (int64_t)(t->nb[3] / element_size),
+            (int64_t)(t->nb[2] / element_size),
+            (int64_t)(t->nb[1] / element_size),
+            (int64_t)(t->nb[0] / element_size),
+        };
+    };
+
+    const std::array<int64_t, 4> x_strides = needs_fp16_path ? default_nchw_strides(x_dims)
+                                                             : strides_from_tensor(src, ggml_type_size(src->type));
+    const std::array<int64_t, 4> y_strides = convert_output_to_fp32 ? default_nchw_strides(y_dims)
+                                                                    : strides_from_tensor(dst, ggml_type_size(dst->type));
+    const std::array<int64_t, 4> w_strides = strides_from_tensor(kernel, ggml_type_size(kernel->type));
+
+    struct ggml_cudnn_conv2d_key {
+        std::array<int64_t, 4> x_dims;
+        std::array<int64_t, 4> x_strides;
+        std::array<int64_t, 4> w_dims;
+        std::array<int64_t, 4> w_strides;
+        std::array<int64_t, 4> y_dims;
+        std::array<int64_t, 4> y_strides;
+        std::array<int64_t, 2> padding;
+        std::array<int64_t, 2> stride;
+        std::array<int64_t, 2> dilation;
+        int32_t x_type;
+        int32_t w_type;
+        int32_t y_type;
+        int32_t compute_type;
+
+        bool operator<(const ggml_cudnn_conv2d_key & other) const {
+            return std::tie(x_dims, x_strides, w_dims, w_strides,
+                            y_dims, y_strides, padding, stride, dilation,
+                            x_type, w_type, y_type, compute_type) <
+                   std::tie(other.x_dims, other.x_strides, other.w_dims, other.w_strides,
+                            other.y_dims, other.y_strides, other.padding, other.stride, other.dilation,
+                            other.x_type, other.w_type, other.y_type, other.compute_type);
+        }
+    };
+
+    static std::map<ggml_cudnn_conv2d_key, ggml_cudnn_graph_cache_value> s_cudnn_conv2d_graph_cache;
+    static std::mutex s_cudnn_conv2d_graph_cache_mutex;
+
+    ggml_cudnn_conv2d_key key = {
+        x_dims, x_strides,
+        w_dims, w_strides,
+        y_dims, y_strides,
+        { (int64_t)P1, (int64_t)P0 },
+        { (int64_t)S1, (int64_t)S0 },
+        { (int64_t)D1, (int64_t)D0 },
+        static_cast<int32_t>(x_data_type),
+        static_cast<int32_t>(w_data_type),
+        static_cast<int32_t>(y_data_type),
+        static_cast<int32_t>(compute_data_type)
+    };
+
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t workspace_size = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(s_cudnn_conv2d_graph_cache_mutex);
+        auto it = s_cudnn_conv2d_graph_cache.find(key);
+        if (it != s_cudnn_conv2d_graph_cache.end()) {
+            graph = it->second.graph;
+            workspace_size = it->second.workspace_size;
+        } else {
+            auto new_graph = std::make_shared<fe::graph::Graph>();
+            new_graph->set_io_data_type(x_data_type)
+                     .set_intermediate_data_type(compute_data_type)
+                     .set_compute_data_type(compute_data_type);
+
+            auto X = new_graph->tensor(fe::graph::Tensor_attributes()
+                            .set_uid(X_UID)
+                            .set_dim({ x_dims[0], x_dims[1], x_dims[2], x_dims[3] })
+                            .set_stride({ x_strides[0], x_strides[1], x_strides[2], x_strides[3] })
+                            .set_data_type(x_data_type));
+
+            auto W = new_graph->tensor(fe::graph::Tensor_attributes()
+                            .set_uid(W_UID)
+                            .set_dim({ w_dims[0], w_dims[1], w_dims[2], w_dims[3] })
+                            .set_stride({ w_strides[0], w_strides[1], w_strides[2], w_strides[3] })
+                            .set_data_type(w_data_type));
+
+            auto conv_options = fe::graph::Conv_fprop_attributes()
+                                     .set_padding({ key.padding[0], key.padding[1] })
+                                     .set_stride({ key.stride[0], key.stride[1] })
+                                     .set_dilation({ key.dilation[0], key.dilation[1] });
+
+            auto Y = new_graph->conv_fprop(X, W, conv_options);
+            Y->set_uid(Y_UID)
+             .set_output(true)
+             .set_dim({ y_dims[0], y_dims[1], y_dims[2], y_dims[3] })
+             .set_stride({ y_strides[0], y_strides[1], y_strides[2], y_strides[3] })
+             .set_data_type(y_data_type);
+
+            auto build_status = new_graph->build(cudnn_handle, {fe::HeurMode_t::A});
+            if (!build_status.is_good()) {
+            GGML_LOG_ERROR("%s: cuDNN graph build failed: %s\n", __func__, build_status.get_message().c_str());
+                GGML_ABORT("cuDNN graph build failed for conv2d");
             }
+
+            auto workspace_status = new_graph->get_workspace_size(workspace_size);
+            if (!workspace_status.is_good()) {
+            GGML_LOG_ERROR("%s: cuDNN get_workspace_size failed: %s\n", __func__, workspace_status.get_message().c_str());
+                GGML_ABORT("cuDNN workspace query failed for conv2d");
+            }
+
+            s_cudnn_conv2d_graph_cache[key] = { new_graph, workspace_size };
+            graph = std::move(new_graph);
         }
     }
 
-    GGML_ASSERT(algo_found && "cuDNN could not find a suitable algorithm for conv2d.");
+    GGML_ASSERT(graph != nullptr);
 
-    ggml_cuda_pool_alloc<char> workspace(ctx.pool(id));
-    if (final_workspace_size > 0) {
-        workspace.alloc(final_workspace_size);
+    ggml_cuda_pool_alloc<int8_t> workspace(ctx.pool(id));
+    if (workspace_size > 0) {
+        workspace.alloc(workspace_size);
     }
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    std::unordered_map<int64_t, void *> variant_pack = {
+        { X_UID, const_cast<void *>(x_ptr) },
+        { W_UID, kernel->data },
+        { Y_UID, y_ptr }
+    };
 
-    CUDNN_CHECK(cudnnConvolutionForward(cudnn_handle,
-        &alpha, src_desc, src_data,
-        kernel_desc, kernel->data,
-        conv_desc, final_algo, workspace.get(), final_workspace_size,
-        &beta, dst_desc, dst_data));
+    auto execute_status = graph->execute(cudnn_handle, variant_pack, workspace.get());
+    if (!execute_status.is_good()) {
+        GGML_LOG_ERROR("%s: cuDNN graph execute failed: %s\n", __func__, execute_status.get_message().c_str());
+        GGML_ABORT("cuDNN graph execute failed for conv2d");
+    }
 
-    if (src->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F16) {
+    if (convert_output_to_fp32) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-        to_fp32_cuda((const half*)dst_data, (float*)dst->data, ggml_nelements(dst), stream);
+        to_fp32_cuda((const half *) y_ptr, (float *) dst->data, ggml_nelements(dst), stream);
     }
-
-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(src_desc));
-    CUDNN_CHECK(cudnnDestroyFilterDescriptor(kernel_desc));
-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(dst_desc));
-    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
