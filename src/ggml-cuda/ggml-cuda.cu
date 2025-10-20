@@ -3209,11 +3209,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
+static bool check_node_graph_compatibility(ggml_cgraph * cgraph,
     bool use_cuda_graph) {
 
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
-    cuda_ctx->cuda_graph->cpy_dest_ptrs.clear();
 
     const std::string gemma3n_per_layer_proj_src0_name = "inp_per_layer_selected";
     const std::string gemma3n_per_layer_proj_src1_name = "per_layer_proj";
@@ -3264,31 +3263,9 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
 #endif
         }
 
-        if (node->op == GGML_OP_CPY) {
-
-            // Store the pointers which are updated for each token, such that these can be sent
-            // to the device and accessed using indirection from CUDA graph
-            cuda_ctx->cuda_graph->cpy_dest_ptrs.push_back((char *) node->src[1]->data);
-
-            // store a pointer to each copy op CUDA kernel to identify it later
-            void * ptr = ggml_cuda_cpy_fn(node->src[0], node->src[1]);
-            if (!ptr) {
-                use_cuda_graph = false;
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported copy op\n", __func__);
-#endif
-            }
-        }
-
         if (!use_cuda_graph) {
             break;
         }
-    }
-
-    if (use_cuda_graph) {
-        cuda_ctx->cuda_graph->use_cpy_indirection = true;
-        // copy pointers to GPU so they can be accessed via indirection within CUDA graph
-        ggml_cuda_cpy_dest_ptrs_copy(cuda_ctx->cuda_graph.get(), cuda_ctx->cuda_graph->cpy_dest_ptrs.data(), cuda_ctx->cuda_graph->cpy_dest_ptrs.size(), cuda_ctx->stream());
     }
 
     return use_cuda_graph;
@@ -3309,7 +3286,6 @@ static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_p
 
 static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
     if (node->data != graph_node_properties->node_address &&
-          node->op != GGML_OP_CPY &&
           node->op != GGML_OP_VIEW) {
         return false;
     }
@@ -3330,7 +3306,6 @@ static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_gra
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (node->src[i] &&
             node->src[i]->data != graph_node_properties->src_address[i] &&
-            node->op != GGML_OP_CPY &&
             node->op != GGML_OP_VIEW
         ) {
             return false;
@@ -3477,7 +3452,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, 
         }
 
         //if rms norm is the B operand, then we don't handle broadcast
-        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm->src[1])) {
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
             return false;
         }
 
@@ -3696,7 +3671,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (use_cuda_graph) {
         cuda_graph_update_required = is_cuda_graph_update_required(cuda_ctx, cgraph);
 
-        use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(cuda_ctx, cgraph, use_cuda_graph);
+        use_cuda_graph = check_node_graph_compatibility(cgraph, use_cuda_graph);
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph && cuda_graph_update_required) {
@@ -3721,10 +3696,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-    }
-
-    if (!use_cuda_graph) {
-        cuda_ctx->cuda_graph->use_cpy_indirection = false;
     }
 
 #else
