@@ -1954,6 +1954,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 bool masked = t != 0;
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
             } break;
+        case GGML_OP_SAGE_ATTN_SM89_FP16:
+            {
+                GGML_ABORT("ggml_compute_forward_sage_attn_sm89_fp16: unsupported on CPU");
+            } break;
         case GGML_OP_SSM_CONV:
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
@@ -2291,6 +2295,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_SAGE_ATTN_SM89_FP16:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_RWKV_WKV6:
@@ -2818,6 +2823,10 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne20 = node->src[2]->ne[0]; // DV
 
                         cur = sizeof(float)*(1*ne10 + 2*ne20)*n_tasks; // 1x head size K + 2x head size V (per thread)
+                    } break;
+                case GGML_OP_SAGE_ATTN_SM89_FP16:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

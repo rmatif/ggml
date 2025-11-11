@@ -427,6 +427,11 @@ extern "C" {
         GGML_PREC_F32     = 10,
     };
 
+    enum ggml_sage_qk_granularity {
+        GGML_SAGE_QK_GRANULARITY_PER_WARP   = 2,
+        GGML_SAGE_QK_GRANULARITY_PER_THREAD = 3,
+    };
+
     // model file types
     enum ggml_ftype {
         GGML_FTYPE_UNKNOWN        = -1,
@@ -533,6 +538,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_SAGE_ATTN_SM89_FP16,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2251,8 +2257,18 @@ extern "C" {
             const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
-            struct ggml_tensor * a,
-            struct ggml_tensor * sinks);
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks);
+
+    GGML_API struct ggml_tensor * ggml_sage_attn_sm89_fp16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 softmax_scale,
+        bool                  is_causal,
+        bool                  smooth_k,
+        enum ggml_sage_qk_granularity quant_granularity);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

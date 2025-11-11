@@ -5666,6 +5666,61 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_sage_attn_vs_flash : public test_case {
+    const int64_t head_dim;
+    const int64_t seq_q;
+    const int64_t seq_k;
+    const int64_t num_q_heads;
+    const int64_t num_k_heads;
+    const int64_t batch;
+    const bool    is_causal;
+    const bool    smooth_k;
+    const ggml_sage_qk_granularity granularity;
+
+    test_sage_attn_vs_flash(int64_t head_dim, int64_t seq_q, int64_t seq_k,
+            int64_t num_q_heads, int64_t num_k_heads, int64_t batch,
+            bool is_causal, bool smooth_k,
+            ggml_sage_qk_granularity granularity = GGML_SAGE_QK_GRANULARITY_PER_WARP)
+        : head_dim(head_dim)
+        , seq_q(seq_q)
+        , seq_k(seq_k)
+        , num_q_heads(num_q_heads)
+        , num_k_heads(num_k_heads)
+        , batch(batch)
+        , is_causal(is_causal)
+        , smooth_k(smooth_k)
+        , granularity(granularity) {
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(head_dim, seq_q, seq_k, num_q_heads, num_k_heads, batch, is_causal, smooth_k, granularity);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_q, num_q_heads, batch);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_k, num_k_heads, batch);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, seq_k, num_k_heads, batch);
+
+        const float scale = 1.0f/std::sqrt((float) head_dim);
+
+        ggml_tensor * sage = ggml_sage_attn_sm89_fp16(ctx, q, k, v, scale, is_causal, smooth_k, granularity);
+        ggml_tensor * sage_f32 = ggml_cast(ctx, sage, GGML_TYPE_F32);
+
+        ggml_tensor * qf = ggml_cast(ctx, q, GGML_TYPE_F32);
+        ggml_tensor * kf = ggml_cast(ctx, k, GGML_TYPE_F32);
+        ggml_tensor * vf = ggml_cast(ctx, v, GGML_TYPE_F32);
+
+        ggml_tensor * flash = ggml_flash_attn_ext(ctx, qf, kf, vf, /*mask=*/nullptr, scale, 0.0f, 0.0f);
+        ggml_tensor * diff  = ggml_sub(ctx, sage_f32, flash);
+        ggml_tensor * mse   = ggml_mean(ctx, ggml_mul(ctx, diff, diff));
+        return mse;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -7587,6 +7642,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 1}, {3, 3, 1, 9}, 2));
 
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
+#if defined(GGML_USE_CUDA)
+    test_cases.emplace_back(new test_sage_attn_vs_flash(128, 256, 256, 8, 4, 2, false, true));
+    test_cases.emplace_back(new test_sage_attn_vs_flash(64, 128, 128, 12, 6, 1, true, true));
+    test_cases.emplace_back(new test_sage_attn_vs_flash(128, 256, 256, 8, 4, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD));
+#endif
 
 
     for (int n_token : {1, 512}) {

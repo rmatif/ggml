@@ -993,6 +993,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
+    "SAGE_ATTN_SM89_FP16",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1019,7 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1123,7 +1124,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5143,6 +5144,49 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+struct ggml_tensor * ggml_sage_attn_sm89_fp16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 softmax_scale,
+        bool                  is_causal,
+        bool                  smooth_k,
+        enum ggml_sage_qk_granularity quant_granularity) {
+    GGML_ASSERT(q->type == k->type && q->type == v->type);
+    GGML_ASSERT(q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_BF16);
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(quant_granularity == GGML_SAGE_QK_GRANULARITY_PER_WARP ||
+                quant_granularity == GGML_SAGE_QK_GRANULARITY_PER_THREAD);
+
+    int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, 4, ne);
+
+    struct {
+        float    scale;
+        int32_t  is_causal;
+        int32_t  smooth_k;
+        int32_t  quant_granularity;
+    } params = {
+        softmax_scale,
+        is_causal ? 1 : 0,
+        smooth_k ? 1 : 0,
+        (int32_t) quant_granularity,
+    };
+
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_SAGE_ATTN_SM89_FP16;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+
+    return result;
 }
 
 // ggml_flash_attn_back

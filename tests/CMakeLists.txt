@@ -354,3 +354,8 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 endif()
+
+if (GGML_CUDA)
+    add_executable(test-sageflash test-sageflash.cpp)
+    target_link_libraries(test-sageflash PRIVATE ggml ggml-cuda)
+endif()
