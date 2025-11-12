@@ -22,8 +22,18 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdio>
 
 namespace ggml_cuda_sage {
+
+struct quant_debug_config {
+    uint32_t stride = 0;
+    uint32_t * token_start = nullptr;
+    float * amax = nullptr;
+    float * scale = nullptr;
+    half * samples = nullptr;
+    uint32_t sample_stride = 0;
+};
 
 template <typename T>
 __device__ __forceinline__ float convert_to_float(T val) {
@@ -71,7 +81,8 @@ __global__ void quant_int8_kernel(
         const uint32_t stride_seq_output,
         const uint32_t stride_h_output,
         const uint32_t stride_bz_scale,
-        const uint32_t stride_h_scale) {
+        const uint32_t stride_h_scale,
+        quant_debug_config dbg = {}) {
     static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value,
                   "Only half and bfloat16 are supported");
     static_assert(num_pack_per_thread > 0, "num_pack_per_thread must be > 0");
@@ -151,6 +162,38 @@ __global__ void quant_int8_kernel(
     if (thread_id == 0) {
         s_amax = block_amax_val;
         scale_ptr_base[0] = s_amax / 127.0f;
+#if defined(GGML_SAGE_DEBUG_QUANT)
+        const uint32_t token_start = thread_base_token;
+        printf("SAGE_Q_DEBUG bz=%u head=%u block=%u start=%u tokens=%u amax=%.6f\n",
+               batch_id, head_id, bx, token_start, BLOCK_SIZE, s_amax);
+#endif
+
+        if (dbg.token_start != nullptr && dbg.stride != 0) {
+            const size_t scale_index = scale_ptr_base - scale;
+            dbg.token_start[scale_index] = thread_base_token;
+            if (dbg.amax) {
+                dbg.amax[scale_index] = s_amax;
+            }
+            if (dbg.scale) {
+                dbg.scale[scale_index] = scale_ptr_base[0];
+            }
+            if (dbg.samples && dbg.sample_stride != 0) {
+                const size_t sample_offset = scale_index * dbg.sample_stride;
+                half * dst_samples = dbg.samples + sample_offset;
+                const uint32_t token_start_blk = thread_base_token;
+                const uint32_t token_end_blk = min(token_start_blk + BLOCK_SIZE, num_tokens);
+                const uint32_t tokens_to_copy = min((uint32_t)(dbg.sample_stride / head_dim), token_end_blk - token_start_blk);
+                // copy raw values for the configured number of tokens in this block
+                for (uint32_t tok = 0; tok < tokens_to_copy; ++tok) {
+                    const uint32_t src_token = token_start_blk + tok;
+                    const T * src_ptr = input + batch_id*stride_bz_input + head_id*stride_h_input + src_token*stride_seq_input;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        const float val = convert_to_float(src_ptr[d]);
+                        dst_samples[tok*head_dim + d] = __float2half(val);
+                    }
+                }
+            }
+        }
     }
     __syncthreads();
 

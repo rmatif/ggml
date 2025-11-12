@@ -40,6 +40,22 @@
 #define MMA_SV_N 16
 #define MMA_SV_K 32
 
+struct sage_kernel_debug_q {
+  uint32_t stride = 0;
+  uint32_t * token_start = nullptr;
+  uint32_t * scale_index = nullptr;
+  float * scale_value = nullptr;
+  uint32_t iter_stride = 0;
+  uint32_t iter_count = 0;
+  float * k_scale_iter = nullptr;
+  float * dequant_iter = nullptr;
+  float * sm_scale_iter = nullptr;
+  uint32_t * k_scale_index = nullptr;
+  float * k_scale_value = nullptr;
+  float * dequant_scale = nullptr;
+  float * sm_scale_value = nullptr;
+};
+
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
         typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false>
 __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -49,7 +65,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
                       const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
-                      float sm_scale)
+                      float sm_scale,
+                      sage_kernel_debug_q dbg_q)
 {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
@@ -84,6 +101,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   const uint32_t bx = blockIdx.x;
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
+
+  const uint32_t warp_linear = bx * num_warps_q + get_warp_idx_q<num_warps_q, num_warps_k>();
 
   // transfer to base 2 instead of base e with better numerical efficiency
   sm_scale *= math::log2e;
@@ -250,10 +269,65 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
   float q_scale = Q_scale[q_scale_idx];
 
+  auto dbg_record_iter = [&](uint32_t iter_idx, float k_scale_val, float dequant_val, float sm_val) {
+    if (dbg_q.iter_stride == 0 || dbg_q.iter_count == 0 || iter_idx >= dbg_q.iter_count || get_lane_id() != 0) {
+      return;
+    }
+    const size_t iter_region = (size_t) dbg_q.iter_stride * dbg_q.iter_count;
+    const size_t head_base = ((size_t) batch_id * num_qo_heads + head_id) * iter_region;
+    const size_t offset = head_base + (size_t) iter_idx * dbg_q.iter_stride + warp_linear;
+    if (dbg_q.k_scale_iter) {
+      dbg_q.k_scale_iter[offset] = k_scale_val;
+    }
+    if (dbg_q.dequant_iter) {
+      dbg_q.dequant_iter[offset] = dequant_val;
+    }
+    if (dbg_q.sm_scale_iter) {
+      dbg_q.sm_scale_iter[offset] = sm_val;
+    }
+  };
+
+  if (dbg_q.stride != 0 && dbg_q.token_start != nullptr && get_lane_id() == 0)
+  {
+    const size_t dbg_index = ((size_t) batch_id * num_qo_heads + head_id) * dbg_q.stride + warp_linear;
+    const uint32_t token_start = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q;
+    dbg_q.token_start[dbg_index] = token_start;
+    if (dbg_q.scale_index != nullptr)
+    {
+      dbg_q.scale_index[dbg_index] = q_scale_idx;
+    }
+    if (dbg_q.scale_value != nullptr)
+    {
+      dbg_q.scale_value[dbg_index] = q_scale;
+    }
+  }
+
   float original_sm_scale = sm_scale;
   float dequant_scale = q_scale * K_scale[k_scale_idx + 0 * k_scale_advance_offset];
 
+  if (dbg_q.stride != 0 && dbg_q.token_start != nullptr && get_lane_id() == 0)
+  {
+    const size_t dbg_index = ((size_t) batch_id * num_qo_heads + head_id) * dbg_q.stride + warp_linear;
+    if (dbg_q.k_scale_index != nullptr)
+    {
+      dbg_q.k_scale_index[dbg_index] = k_scale_idx;
+    }
+    if (dbg_q.k_scale_value != nullptr)
+    {
+      dbg_q.k_scale_value[dbg_index] = K_scale[k_scale_idx + 0 * k_scale_advance_offset];
+    }
+    if (dbg_q.dequant_scale != nullptr)
+    {
+      dbg_q.dequant_scale[dbg_index] = dequant_scale;
+    }
+    if (dbg_q.sm_scale_value != nullptr)
+    {
+      dbg_q.sm_scale_value[dbg_index] = original_sm_scale * dequant_scale;
+    }
+  }
+
   sm_scale = original_sm_scale * dequant_scale;
+  dbg_record_iter(0, K_scale[k_scale_idx], dequant_scale, sm_scale);
 
   // load V
   // ! we assume that V is padded. If not, there might be illegal memory access or nan issue.
@@ -330,8 +404,10 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
     cp_async::commit_group();
 
-    dequant_scale = q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
+    const float iter_k_scale = K_scale[k_scale_idx + iter * k_scale_advance_offset];
+    dequant_scale = q_scale * iter_k_scale;
     sm_scale = original_sm_scale * dequant_scale;
+    dbg_record_iter(iter, iter_k_scale, dequant_scale, sm_scale);
     
     // ensure V is ready
     cp_async::wait_group<1>();
@@ -438,8 +514,10 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
     cp_async::commit_group();
 
-    dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
+    const float final_k_scale = K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
+    dequant_scale = q_scale * final_k_scale;
     sm_scale = original_sm_scale * dequant_scale;
+    dbg_record_iter(num_iterations - 1, final_k_scale, dequant_scale, sm_scale);
 
     // ensure V is ready
     cp_async::wait_group<1>();
@@ -701,8 +779,3 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     }
   }
 }
-
-
-
-
-

@@ -6,13 +6,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
 
 struct sage_case {
-    const char * name;
+    std::string name;
     int head_dim;
     int seq_q;
     int seq_k;
@@ -29,6 +30,9 @@ struct case_result {
     double flash_ms;
     double max_diff;
     double rms_diff;
+    size_t max_index;
+    float  sage_val;
+    float  flash_val;
 };
 
 struct cli_options {
@@ -36,7 +40,20 @@ struct cli_options {
     int iters = 1;
     uint64_t seed = 1234;
     bool list_only = false;
+    bool verbose = false;
     bool show_help = false;
+    std::string load_prefix;
+};
+
+struct external_data {
+    bool active = false;
+    sage_case cfg;
+    std::vector<ggml_fp16_t> q;
+    std::vector<ggml_fp16_t> k;
+    std::vector<ggml_fp16_t> v;
+    std::vector<float> ref_sage;
+    std::vector<float> ref_flash;
+    std::string prefix;
 };
 
 static void fill_tensor_uniform(ggml_tensor * tensor, std::mt19937 & rng) {
@@ -63,6 +80,89 @@ static void fill_tensor_uniform(ggml_tensor * tensor, std::mt19937 & rng) {
     }
 
     ggml_backend_tensor_set(tensor, host.data(), 0, host.size());
+}
+
+static bool read_meta_file(const std::string & path, sage_case & cfg) {
+    std::ifstream fin(path);
+    if (!fin) {
+        fprintf(stderr, "failed to open meta file %s\n", path.c_str());
+        return false;
+    }
+    cfg.name = path;
+    std::string key;
+    while (fin >> key) {
+        if (key == "head_dim") {
+            fin >> cfg.head_dim;
+        } else if (key == "seq_q") {
+            fin >> cfg.seq_q;
+        } else if (key == "seq_k") {
+            fin >> cfg.seq_k;
+        } else if (key == "num_q_heads") {
+            fin >> cfg.num_q_heads;
+        } else if (key == "num_k_heads") {
+            fin >> cfg.num_k_heads;
+        } else if (key == "batch") {
+            fin >> cfg.batch;
+        } else if (key == "is_causal") {
+            int v; fin >> v; cfg.is_causal = v != 0;
+        } else if (key == "smooth_k") {
+            int v; fin >> v; cfg.smooth_k = v != 0;
+        } else if (key == "granularity") {
+            std::string val; fin >> val;
+            if (val == "per_thread") {
+                cfg.granularity = GGML_SAGE_QK_GRANULARITY_PER_THREAD;
+            } else {
+                cfg.granularity = GGML_SAGE_QK_GRANULARITY_PER_WARP;
+            }
+        }
+    }
+    return true;
+}
+
+template<typename T>
+static bool load_binary(const std::string & path, std::vector<T> & data, size_t expected_elems) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        fprintf(stderr, "failed to open %s\n", path.c_str());
+        return false;
+    }
+    fin.seekg(0, std::ios::end);
+    size_t bytes = fin.tellg();
+    fin.seekg(0, std::ios::beg);
+    size_t elems = bytes / sizeof(T);
+    if (expected_elems && elems != expected_elems) {
+        fprintf(stderr, "unexpected size in %s (got %zu expected %zu)\n", path.c_str(), elems, expected_elems);
+        return false;
+    }
+    data.resize(elems);
+    fin.read(reinterpret_cast<char *>(data.data()), bytes);
+    return true;
+}
+
+static bool load_external_case(const std::string & prefix, external_data & ext) {
+    ext.prefix = prefix;
+    sage_case cfg = {};
+    if (!read_meta_file(prefix + ".meta", cfg)) {
+        return false;
+    }
+    if (cfg.head_dim == 0) {
+        fprintf(stderr, "invalid metadata in %s.meta\n", prefix.c_str());
+        return false;
+    }
+    const size_t q_elems = (size_t) cfg.head_dim * cfg.seq_q * cfg.num_q_heads * cfg.batch;
+    const size_t k_elems = (size_t) cfg.head_dim * cfg.seq_k * cfg.num_k_heads * cfg.batch;
+    const size_t v_elems = k_elems;
+    const size_t out_elems = (size_t) cfg.head_dim * cfg.seq_q * cfg.num_q_heads * cfg.batch;
+
+    if (!load_binary(prefix + ".q.bin", ext.q, q_elems)) return false;
+    if (!load_binary(prefix + ".k.bin", ext.k, k_elems)) return false;
+    if (!load_binary(prefix + ".v.bin", ext.v, v_elems)) return false;
+    load_binary(prefix + ".sage.bin", ext.ref_sage, out_elems);
+    load_binary(prefix + ".flash.bin", ext.ref_flash, out_elems);
+
+    ext.cfg = cfg;
+    ext.active = true;
+    return true;
 }
 
 static double run_graph(ggml_context * ctx, ggml_backend_t backend, ggml_tensor * root, std::vector<float> & output) {
@@ -92,8 +192,15 @@ static size_t estimate_ctx_mem(const sage_case & cfg) {
     return bytes;
 }
 
-static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint64_t seed) {
+static void tensor_set_from_vec(ggml_tensor * tensor, const std::vector<ggml_fp16_t> & data) {
+    GGML_ASSERT(ggml_nbytes(tensor) == data.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+}
+
+static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint64_t seed, const external_data * ext = nullptr,
+        std::vector<float> * sage_dump = nullptr, std::vector<float> * flash_dump = nullptr) {
     std::mt19937 rng(seed);
+    const bool use_loaded = ext && ext->active;
 
     ggml_init_params params = {
         /* .mem_size   = */ estimate_ctx_mem(cfg),
@@ -121,9 +228,15 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer);
 
-    fill_tensor_uniform(q, rng);
-    fill_tensor_uniform(k, rng);
-    fill_tensor_uniform(v, rng);
+    if (use_loaded) {
+        tensor_set_from_vec(q, ext->q);
+        tensor_set_from_vec(k, ext->k);
+        tensor_set_from_vec(v, ext->v);
+    } else {
+        fill_tensor_uniform(q, rng);
+        fill_tensor_uniform(k, rng);
+        fill_tensor_uniform(v, rng);
+    }
 
     std::vector<float> sage_out;
     std::vector<float> flash_out;
@@ -131,6 +244,9 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
     case_result res = {};
     res.sage_ms = run_graph(ctx, backend, sage_f32, sage_out);
     res.flash_ms = run_graph(ctx, backend, flash, flash_out);
+    res.max_index = 0;
+    res.sage_val = 0.0f;
+    res.flash_val = 0.0f;
 
     auto has_non_finite = [](const std::vector<float> & vals) {
         for (float v : vals) {
@@ -145,7 +261,7 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
         const bool sage_bad = has_non_finite(sage_out);
         const bool flash_bad = has_non_finite(flash_out);
         printf("WARNING[%s]: non-finite outputs detected (sage=%d, flash=%d)\n",
-               cfg.name,
+               cfg.name.c_str(),
                sage_bad ? 1 : 0,
                flash_bad ? 1 : 0);
         if (sage_bad) {
@@ -159,18 +275,34 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
         res.max_diff = std::numeric_limits<double>::infinity();
         res.rms_diff = std::numeric_limits<double>::quiet_NaN();
     } else {
-        res.max_diff = 0.0;
         double sum_sq = 0.0;
+        double max_abs = 0.0;
+        size_t max_idx = 0;
         for (size_t i = 0; i < sage_out.size(); ++i) {
             const double diff = (double) sage_out[i] - (double) flash_out[i];
-            res.max_diff = std::max(res.max_diff, std::abs(diff));
+            const double abs_diff = std::abs(diff);
+            if (abs_diff > max_abs) {
+                max_abs = abs_diff;
+                max_idx = i;
+                res.sage_val = sage_out[i];
+                res.flash_val = flash_out[i];
+            }
             sum_sq += diff*diff;
         }
+        res.max_diff = max_abs;
+        res.max_index = max_idx;
         res.rms_diff = std::sqrt(sum_sq / sage_out.size());
     }
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+
+    if (sage_dump) {
+        *sage_dump = sage_out;
+    }
+    if (flash_dump) {
+        *flash_dump = flash_out;
+    }
 
     return res;
 }
@@ -182,6 +314,7 @@ static case_result run_case_iters(const sage_case & cfg, ggml_backend_t backend,
     double flash_sum = 0.0;
     double rms_sum = 0.0;
     double max_diff = 0.0;
+    bool max_init = false;
 
     for (int it = 0; it < iters; ++it) {
         const uint64_t seed = seed_base + (uint64_t) it * 10007ull;
@@ -189,7 +322,13 @@ static case_result run_case_iters(const sage_case & cfg, ggml_backend_t backend,
         sage_sum += cur.sage_ms;
         flash_sum += cur.flash_ms;
         rms_sum += cur.rms_diff;
-        max_diff = std::max(max_diff, cur.max_diff);
+        if (!max_init || cur.max_diff > max_diff) {
+            max_diff = cur.max_diff;
+            agg.max_index = cur.max_index;
+            agg.sage_val = cur.sage_val;
+            agg.flash_val = cur.flash_val;
+            max_init = true;
+        }
     }
 
     agg.sage_ms = sage_sum / iters;
@@ -207,9 +346,9 @@ static const char * granularity_name(ggml_sage_qk_granularity gran) {
     }
 }
 
-static void print_case_report(const sage_case & cfg, const case_result & res, int iters) {
+static void print_case_report(const sage_case & cfg, const case_result & res, int iters, bool verbose) {
     const double speedup = (res.sage_ms > 0.0) ? (res.flash_ms / res.sage_ms) : 0.0;
-    printf("\nCase %s\n", cfg.name);
+    printf("\nCase %s\n", cfg.name.c_str());
     printf("  shape: batch=%d seq_q=%d seq_k=%d nq=%d nk=%d d=%d causal=%d smooth_k=%d\n",
            cfg.batch, cfg.seq_q, cfg.seq_k, cfg.num_q_heads, cfg.num_k_heads, cfg.head_dim,
            cfg.is_causal ? 1 : 0, cfg.smooth_k ? 1 : 0);
@@ -217,6 +356,27 @@ static void print_case_report(const sage_case & cfg, const case_result & res, in
     printf("  iterations: %d\n", iters);
     printf("  timings (avg): sage %.3f ms, flash %.3f ms (speedup %.2fx)\n", res.sage_ms, res.flash_ms, speedup);
     printf("  diff: max %.3e rms_avg %.3e\n", res.max_diff, res.rms_diff);
+    if (verbose && std::isfinite(res.max_diff)) {
+        size_t idx = res.max_index;
+        const int64_t dim = cfg.head_dim;
+        const int64_t seq = cfg.seq_q;
+        const int64_t heads = cfg.num_q_heads;
+        const int64_t batch = cfg.batch;
+        int64_t d0 = idx % dim;
+        idx /= dim;
+        int64_t d1 = idx % seq;
+        idx /= seq;
+        int64_t d2 = idx % heads;
+        idx /= heads;
+        int64_t d3 = idx;
+        printf("  worst element: batch=%lld head=%lld seq=%lld dim=%lld (sage=%e flash=%e)\n",
+               (long long) d3,
+               (long long) d2,
+               (long long) d1,
+               (long long) d0,
+               (double) res.sage_val,
+               (double) res.flash_val);
+    }
 }
 
 static void print_usage(const char * prog) {
@@ -227,6 +387,8 @@ static void print_usage(const char * prog) {
     printf("  --iters <n>         Number of iterations per case (default 1).\n");
     printf("  --seed <value>      Base RNG seed (default 1234).\n");
     printf("  --list              List available case names and exit.\n");
+    printf("  --verbose           Print additional per-case diagnostics (worst element info).\n");
+    printf("  --load <prefix>     Load tensors from files generated by compare_sageattention.py.\n");
     printf("  -h, --help          Show this help message.\n");
 }
 
@@ -279,6 +441,14 @@ static bool parse_cli(int argc, char ** argv, cli_options & opts) {
         } else if (arg == "--help" || arg == "-h") {
             opts.show_help = true;
             return true;
+        } else if (arg == "--verbose") {
+            opts.verbose = true;
+        } else if (arg == "--load") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--load requires a prefix\n");
+                return false;
+            }
+            opts.load_prefix = argv[++i];
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return false;
@@ -310,18 +480,32 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const std::vector<sage_case> cases = {
+    std::vector<sage_case> cases = {
         {"b2_seq256_d128", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_WARP},
         {"b1_causal_seq128_d64", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_WARP},
+        {"b1_causal_seq128_d64_nosmooth", 64, 128, 128, 12, 6, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
         {"b4_seq512_d128", 128, 512, 512, 8, 4, 4, false, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
         {"b1_long_seq768_d128_causal", 128, 768, 768, 4, 4, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
         {"b2_seq256_d128_thread", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD},
+        {"b1_causal_seq128_d64_thread", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD},
     };
+
+    external_data loaded;
+    if (!opts.load_prefix.empty()) {
+        if (!load_external_case(opts.load_prefix, loaded)) {
+            fprintf(stderr, "failed to load case from %s\n", opts.load_prefix.c_str());
+            ggml_backend_free(backend);
+            return 1;
+        }
+        loaded.cfg.name = opts.load_prefix;
+        cases = { loaded.cfg };
+        opts.case_filters.clear();
+    }
 
     if (opts.list_only) {
         printf("Available cases:\n");
         for (const auto & cfg : cases) {
-            printf("  %s\n", cfg.name);
+            printf("  %s\n", cfg.name.c_str());
         }
         ggml_backend_free(backend);
         return 0;
@@ -367,9 +551,44 @@ int main(int argc, char ** argv) {
     std::string worst_case = "n/a";
 
     for (const case_entry & entry : selected) {
-        const uint64_t seed = opts.seed + (uint64_t) entry.index * 1000003ull;
-        const case_result res = run_case_iters(*entry.cfg, backend, seed, opts.iters);
-        print_case_report(*entry.cfg, res, opts.iters);
+        case_result res;
+        std::vector<float> exported_sage;
+        std::vector<float> exported_flash;
+        if (loaded.active) {
+            if (opts.iters != 1 && entry.index == 0) {
+                fprintf(stderr, "warning: overriding iters to 1 for loaded case\n");
+                opts.iters = 1;
+            }
+            res = run_case(*entry.cfg, backend, opts.seed, &loaded, &exported_sage, &exported_flash);
+        } else {
+            const uint64_t seed = opts.seed + (uint64_t) entry.index * 1000003ull;
+            res = run_case_iters(*entry.cfg, backend, seed, opts.iters);
+        }
+        print_case_report(*entry.cfg, res, opts.iters, opts.verbose);
+
+        if (loaded.active && entry.index == 0) {
+            auto compare_to_ref = [](const char * label, const std::vector<float> & ref, const std::vector<float> & cur) {
+                if (ref.empty() || ref.size() != cur.size()) {
+                    return;
+                }
+                double max_diff = 0.0;
+                double sum_sq = 0.0;
+                size_t max_idx = 0;
+                for (size_t i = 0; i < ref.size(); ++i) {
+                    const double diff = (double) cur[i] - (double) ref[i];
+                    const double abs_diff = std::abs(diff);
+                    if (abs_diff > max_diff) {
+                        max_diff = abs_diff;
+                        max_idx = i;
+                    }
+                    sum_sq += diff*diff;
+                }
+                const double rms = std::sqrt(sum_sq / ref.size());
+                printf("  %s ref diff: max %.3e rms %.3e (idx %zu)\n", label, max_diff, rms, max_idx);
+            };
+            compare_to_ref("sage_vs_ref", loaded.ref_sage, exported_sage);
+            compare_to_ref("flash_vs_ref", loaded.ref_flash, exported_flash);
+        }
 
         const double speedup = (res.sage_ms > 0.0) ? (res.flash_ms / res.sage_ms) : 0.0;
         if (speedup > best_speedup) {
