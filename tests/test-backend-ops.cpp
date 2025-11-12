@@ -5675,12 +5675,16 @@ struct test_sage_attn_vs_flash : public test_case {
     const int64_t batch;
     const bool    is_causal;
     const bool    smooth_k;
+    const bool    smooth_v;
+    const ggml_sage_pv_accum pv_accum;
     const ggml_sage_qk_granularity granularity;
 
     test_sage_attn_vs_flash(int64_t head_dim, int64_t seq_q, int64_t seq_k,
             int64_t num_q_heads, int64_t num_k_heads, int64_t batch,
             bool is_causal, bool smooth_k,
-            ggml_sage_qk_granularity granularity = GGML_SAGE_QK_GRANULARITY_PER_WARP)
+            ggml_sage_qk_granularity granularity = GGML_SAGE_QK_GRANULARITY_PER_WARP,
+            bool smooth_v = false,
+            ggml_sage_pv_accum pv_accum = GGML_SAGE_PV_ACCUM_FP32_FP16)
         : head_dim(head_dim)
         , seq_q(seq_q)
         , seq_k(seq_k)
@@ -5689,11 +5693,13 @@ struct test_sage_attn_vs_flash : public test_case {
         , batch(batch)
         , is_causal(is_causal)
         , smooth_k(smooth_k)
+        , smooth_v(smooth_v)
+        , pv_accum(pv_accum)
         , granularity(granularity) {
     }
 
     std::string vars() override {
-        return VARS_TO_STR9(head_dim, seq_q, seq_k, num_q_heads, num_k_heads, batch, is_causal, smooth_k, granularity);
+        return VARS_TO_STR11(head_dim, seq_q, seq_k, num_q_heads, num_k_heads, batch, is_causal, smooth_k, smooth_v, pv_accum, granularity);
     }
 
     double max_nmse_err() override {
@@ -5707,7 +5713,7 @@ struct test_sage_attn_vs_flash : public test_case {
 
         const float scale = 1.0f/std::sqrt((float) head_dim);
 
-        ggml_tensor * sage = ggml_sage_attn_sm89_fp16(ctx, q, k, v, scale, is_causal, smooth_k, granularity);
+        ggml_tensor * sage = ggml_sage_attn_sm89_fp16(ctx, q, k, v, scale, is_causal, smooth_k, smooth_v, pv_accum, granularity);
         ggml_tensor * sage_f32 = ggml_cast(ctx, sage, GGML_TYPE_F32);
 
         ggml_tensor * qf = ggml_cast(ctx, q, GGML_TYPE_F32);
@@ -7646,6 +7652,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_sage_attn_vs_flash(128, 256, 256, 8, 4, 2, false, true));
     test_cases.emplace_back(new test_sage_attn_vs_flash(64, 128, 128, 12, 6, 1, true, true));
     test_cases.emplace_back(new test_sage_attn_vs_flash(128, 256, 256, 8, 4, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD));
+    test_cases.emplace_back(new test_sage_attn_vs_flash(64, 128, 128, 8, 4, 1, false, false,
+            GGML_SAGE_QK_GRANULARITY_PER_WARP, true, GGML_SAGE_PV_ACCUM_FP32));
+    test_cases.emplace_back(new test_sage_attn_vs_flash(128, 192, 192, 6, 6, 2, false, true,
+            GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP32));
 #endif
 
 

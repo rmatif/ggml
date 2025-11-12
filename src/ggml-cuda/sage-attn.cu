@@ -1345,7 +1345,8 @@ void quantize_v_to_fp8(
     CUDA_CHECK(cudaGetLastError());
 }
 
-template<typename T, int HEAD_DIM, MaskMode MODE, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, bool FUSE_V_MEAN>
+template<typename T, int HEAD_DIM, MaskMode MODE, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
+         typename SVAccum, bool USE_INST_BUFFER, bool FUSE_V_MEAN, bool USE_PV_FP16_ACCUM>
 void launch_sage_kernel_variant(
         const int8_t * q,
         const int8_t * k,
@@ -1388,15 +1389,15 @@ void launch_sage_kernel_variant(
             DataType::kInt8,
             Q_GRAN,
             K_GRAN,
-            float,
-            true,
+            SVAccum,
+            USE_INST_BUFFER,
             T,
             ComputeUnit::kCudaCore,
             MODE,
             false,
             true,
             FUSE_V_MEAN,
-            true>;
+            USE_PV_FP16_ACCUM>;
 
     CUDA_CHECK(cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
 
@@ -1422,6 +1423,62 @@ void launch_sage_kernel_variant(
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<typename T, int HEAD_DIM, MaskMode MODE, typename SVAccum, bool USE_INST_BUFFER, bool USE_PV_FP16_ACCUM>
+void launch_sage_kernel_dispatch(
+        const int8_t * q,
+        const int8_t * k,
+        const int8_t * v,
+        T * output,
+        const float * q_scale,
+        const float * k_scale,
+        const float * v_scale,
+        const float * v_mean,
+        int batch,
+        int num_q_heads,
+        int num_k_heads,
+        int qo_len,
+        int kv_len,
+        int num_kv_groups,
+        const tensor_strides & q_strides,
+        const tensor_strides & k_strides,
+        const tensor_strides & o_strides,
+        const value_strides & v_strides,
+        float sm_scale,
+        cudaStream_t stream,
+        ggml_sage_qk_granularity granularity,
+        bool fuse_v_mean,
+        const sage_kernel_debug_q & dbg_q = {}) {
+    if (granularity == GGML_SAGE_QK_GRANULARITY_PER_THREAD) {
+        if (fuse_v_mean) {
+            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerThread, QuantGranularity::kPerThread,
+                                       SVAccum, USE_INST_BUFFER, true, USE_PV_FP16_ACCUM>(
+                q, k, v, output, q_scale, k_scale, v_scale, v_mean,
+                batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
+                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
+        } else {
+            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerThread, QuantGranularity::kPerThread,
+                                       SVAccum, USE_INST_BUFFER, false, USE_PV_FP16_ACCUM>(
+                q, k, v, output, q_scale, k_scale, v_scale, nullptr,
+                batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
+                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
+        }
+    } else {
+        if (fuse_v_mean) {
+            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerWarp, QuantGranularity::kPerBlock,
+                                       SVAccum, USE_INST_BUFFER, true, USE_PV_FP16_ACCUM>(
+                q, k, v, output, q_scale, k_scale, v_scale, v_mean,
+                batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
+                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
+        } else {
+            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerWarp, QuantGranularity::kPerBlock,
+                                       SVAccum, USE_INST_BUFFER, false, USE_PV_FP16_ACCUM>(
+                q, k, v, output, q_scale, k_scale, v_scale, nullptr,
+                batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
+                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
+        }
+    }
+}
+
 template<typename T, int HEAD_DIM, MaskMode MODE>
 void launch_sage_kernel(
         const int8_t * q,
@@ -1445,33 +1502,34 @@ void launch_sage_kernel(
         float sm_scale,
         cudaStream_t stream,
         ggml_sage_qk_granularity granularity,
+        ggml_sage_pv_accum pv_accum,
         const sage_kernel_debug_q & dbg_q = {}) {
     const bool fuse_v_mean = v_mean != nullptr;
 
-    if (granularity == GGML_SAGE_QK_GRANULARITY_PER_THREAD) {
-        if (fuse_v_mean) {
-            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerThread, QuantGranularity::kPerThread, true>(
+    switch (pv_accum) {
+        case GGML_SAGE_PV_ACCUM_FP32:
+            launch_sage_kernel_dispatch<T, HEAD_DIM, MODE, float, false, false>(
                 q, k, v, output, q_scale, k_scale, v_scale, v_mean,
                 batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
-        } else {
-            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerThread, QuantGranularity::kPerThread, false>(
+                q_strides, k_strides, o_strides, v_strides,
+                sm_scale, stream, granularity, fuse_v_mean, dbg_q);
+            break;
+        case GGML_SAGE_PV_ACCUM_FP32_FP32:
+            launch_sage_kernel_dispatch<T, HEAD_DIM, MODE, float, true, false>(
                 q, k, v, output, q_scale, k_scale, v_scale, nullptr,
                 batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
-        }
-    } else {
-        if (fuse_v_mean) {
-            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerWarp, QuantGranularity::kPerBlock, true>(
-                q, k, v, output, q_scale, k_scale, v_scale, v_mean,
-                batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
-        } else {
-            launch_sage_kernel_variant<T, HEAD_DIM, MODE, QuantGranularity::kPerWarp, QuantGranularity::kPerBlock, false>(
+                q_strides, k_strides, o_strides, v_strides,
+                sm_scale, stream, granularity, false, dbg_q);
+            break;
+        case GGML_SAGE_PV_ACCUM_FP32_FP16:
+            launch_sage_kernel_dispatch<T, HEAD_DIM, MODE, float, true, true>(
                 q, k, v, output, q_scale, k_scale, v_scale, nullptr,
                 batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                q_strides, k_strides, o_strides, v_strides, sm_scale, stream, dbg_q);
-        }
+                q_strides, k_strides, o_strides, v_strides,
+                sm_scale, stream, granularity, false, dbg_q);
+            break;
+        default:
+            GGML_ABORT("SageAttention SM89: unsupported pv_accum");
     }
 }
 
@@ -1536,7 +1594,9 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float softmax_scale = ggml_get_op_params_f32(dst, 0);
     const bool  is_causal     = ggml_get_op_params_i32(dst, 1) != 0;
     const bool  smooth_k      = ggml_get_op_params_i32(dst, 2) != 0;
-    const auto  granularity   = static_cast<ggml_sage_qk_granularity>(ggml_get_op_params_i32(dst, 3));
+    const bool  smooth_v_param = ggml_get_op_params_i32(dst, 3) != 0;
+    const auto  pv_accum      = static_cast<ggml_sage_pv_accum>(ggml_get_op_params_i32(dst, 4));
+    const auto  granularity   = static_cast<ggml_sage_qk_granularity>(ggml_get_op_params_i32(dst, 5));
     const bool  per_thread_qk = (granularity == GGML_SAGE_QK_GRANULARITY_PER_THREAD);
 
     GGML_UNUSED(is_causal);
@@ -2051,12 +2111,16 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (size_t) batch * num_k_heads * head_dim_padded * kv_len_padded * sizeof(T), stream);
     }
 
+    bool smooth_v = smooth_v_param;
+    if (smooth_v && pv_accum != GGML_SAGE_PV_ACCUM_FP32) {
+        GGML_LOG_WARN("ggml_cuda_sage_attn_sm89_fp16: smooth_v requires pv_accum=FP32; disabling\n");
+        smooth_v = false;
+    }
+    const bool use_pv_fp16_accum = (pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP16);
+    const float v_scale_max = use_pv_fp16_accum ? FP8_SCALE_MAX_FP16 : FP8_SCALE_MAX_FP32;
+
     ggml_cuda_pool_alloc<int8_t> v_fp8(pool, (size_t) batch * num_k_heads * head_dim_padded * kv_len_padded);
     ggml_cuda_pool_alloc<float>  v_scale(pool, (size_t) batch * num_k_heads * head_dim_padded);
-    // The SM89 kernel we target uses the fp32+fp16 PV accumulation path.
-    const bool use_pv_fp16_accum = true;
-    const float v_scale_max = use_pv_fp16_accum ? FP8_SCALE_MAX_FP16 : FP8_SCALE_MAX_FP32;
-    const bool smooth_v = !use_pv_fp16_accum; // disable smoothing when using fp16 accumulators
     float * v_mean_ptr = nullptr;
     std::unique_ptr<ggml_cuda_pool_alloc<float>> v_mean_storage;
     if (smooth_v) {
@@ -2109,14 +2173,14 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
                     q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
-                    sm_scale, stream, granularity, q_kernel_debug);
+                    sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             } else {
                 launch_sage_kernel<T, 64, MaskMode::kNone>(
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
                     q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
-                    sm_scale, stream, granularity, q_kernel_debug);
+                    sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             }
             break;
         case 128:
@@ -2126,14 +2190,14 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
                     q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
-                    sm_scale, stream, granularity, q_kernel_debug);
+                    sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             } else {
                 launch_sage_kernel<T, 128, MaskMode::kNone>(
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
                     q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
-                    sm_scale, stream, granularity, q_kernel_debug);
+                    sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             }
             break;
         default:
@@ -2307,7 +2371,12 @@ bool ggml_cuda_sage_attn_sm89_fp16_supported(int device, const ggml_tensor * dst
         return false;
     }
 
-    const int32_t quant_gran = ggml_get_op_params_i32(dst, 3);
+    const int32_t pv_mode = ggml_get_op_params_i32(dst, 4);
+    if (pv_mode < GGML_SAGE_PV_ACCUM_FP32 || pv_mode > GGML_SAGE_PV_ACCUM_FP32_FP16) {
+        return false;
+    }
+
+    const int32_t quant_gran = ggml_get_op_params_i32(dst, 5);
     if (quant_gran != GGML_SAGE_QK_GRANULARITY_PER_WARP &&
         quant_gran != GGML_SAGE_QK_GRANULARITY_PER_THREAD) {
         return false;

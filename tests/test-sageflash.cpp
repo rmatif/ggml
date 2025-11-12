@@ -23,6 +23,8 @@ struct sage_case {
     bool is_causal;
     bool smooth_k;
     ggml_sage_qk_granularity granularity;
+    bool smooth_v;
+    ggml_sage_pv_accum pv_accum;
 };
 
 struct case_result {
@@ -32,7 +34,8 @@ struct case_result {
     double rms_diff;
     size_t max_index;
     float  sage_val;
-    float  flash_val;
+    float  ref_val;
+    std::string reference;
 };
 
 struct cli_options {
@@ -43,6 +46,18 @@ struct cli_options {
     bool verbose = false;
     bool show_help = false;
     std::string load_prefix;
+    bool granularity_override_set = false;
+    ggml_sage_qk_granularity granularity_override = GGML_SAGE_QK_GRANULARITY_PER_WARP;
+    bool smooth_k_override_set = false;
+    bool smooth_k_override = false;
+    bool smooth_v_override_set = false;
+    bool smooth_v_override = false;
+    bool pv_accum_override_set = false;
+    ggml_sage_pv_accum pv_accum_override = GGML_SAGE_PV_ACCUM_FP32_FP16;
+    enum class compare_mode {
+        flash,
+        sage,
+    } compare = compare_mode::flash;
 };
 
 struct external_data {
@@ -53,6 +68,8 @@ struct external_data {
     std::vector<ggml_fp16_t> v;
     std::vector<float> ref_sage;
     std::vector<float> ref_flash;
+    bool has_ref_sage = false;
+    bool has_ref_flash = false;
     std::string prefix;
 };
 
@@ -82,6 +99,22 @@ static void fill_tensor_uniform(ggml_tensor * tensor, std::mt19937 & rng) {
     ggml_backend_tensor_set(tensor, host.data(), 0, host.size());
 }
 
+static bool parse_pv_accum_string(const std::string & val, ggml_sage_pv_accum & out) {
+    if (val == "fp32") {
+        out = GGML_SAGE_PV_ACCUM_FP32;
+        return true;
+    }
+    if (val == "fp32+fp32") {
+        out = GGML_SAGE_PV_ACCUM_FP32_FP32;
+        return true;
+    }
+    if (val == "fp32+fp16") {
+        out = GGML_SAGE_PV_ACCUM_FP32_FP16;
+        return true;
+    }
+    return false;
+}
+
 static bool read_meta_file(const std::string & path, sage_case & cfg) {
     std::ifstream fin(path);
     if (!fin) {
@@ -90,6 +123,10 @@ static bool read_meta_file(const std::string & path, sage_case & cfg) {
     }
     cfg.name = path;
     std::string key;
+    cfg.granularity = GGML_SAGE_QK_GRANULARITY_PER_WARP;
+    cfg.smooth_v = false;
+    cfg.pv_accum = GGML_SAGE_PV_ACCUM_FP32_FP16;
+
     while (fin >> key) {
         if (key == "head_dim") {
             fin >> cfg.head_dim;
@@ -107,6 +144,14 @@ static bool read_meta_file(const std::string & path, sage_case & cfg) {
             int v; fin >> v; cfg.is_causal = v != 0;
         } else if (key == "smooth_k") {
             int v; fin >> v; cfg.smooth_k = v != 0;
+        } else if (key == "smooth_v") {
+            int v; fin >> v; cfg.smooth_v = v != 0;
+        } else if (key == "pv_accum") {
+            std::string val; fin >> val;
+            if (!parse_pv_accum_string(val, cfg.pv_accum)) {
+                fprintf(stderr, "unknown pv_accum '%s' in %s\n", val.c_str(), path.c_str());
+                return false;
+            }
         } else if (key == "granularity") {
             std::string val; fin >> val;
             if (val == "per_thread") {
@@ -157,8 +202,8 @@ static bool load_external_case(const std::string & prefix, external_data & ext) 
     if (!load_binary(prefix + ".q.bin", ext.q, q_elems)) return false;
     if (!load_binary(prefix + ".k.bin", ext.k, k_elems)) return false;
     if (!load_binary(prefix + ".v.bin", ext.v, v_elems)) return false;
-    load_binary(prefix + ".sage.bin", ext.ref_sage, out_elems);
-    load_binary(prefix + ".flash.bin", ext.ref_flash, out_elems);
+    ext.has_ref_sage = load_binary(prefix + ".sage.bin", ext.ref_sage, out_elems);
+    ext.has_ref_flash = load_binary(prefix + ".flash.bin", ext.ref_flash, out_elems);
 
     ext.cfg = cfg;
     ext.active = true;
@@ -198,7 +243,8 @@ static void tensor_set_from_vec(ggml_tensor * tensor, const std::vector<ggml_fp1
 }
 
 static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint64_t seed, const external_data * ext = nullptr,
-        std::vector<float> * sage_dump = nullptr, std::vector<float> * flash_dump = nullptr) {
+        std::vector<float> * sage_dump = nullptr, std::vector<float> * flash_dump = nullptr,
+        cli_options::compare_mode compare = cli_options::compare_mode::flash) {
     std::mt19937 rng(seed);
     const bool use_loaded = ext && ext->active;
 
@@ -217,7 +263,7 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
 
     const float scale = 1.0f/std::sqrt((float) cfg.head_dim);
 
-    ggml_tensor * sage = ggml_sage_attn_sm89_fp16(ctx, q, k, v, scale, cfg.is_causal, cfg.smooth_k, cfg.granularity);
+    ggml_tensor * sage = ggml_sage_attn_sm89_fp16(ctx, q, k, v, scale, cfg.is_causal, cfg.smooth_k, cfg.smooth_v, cfg.pv_accum, cfg.granularity);
     ggml_tensor * sage_f32 = ggml_cast(ctx, sage, GGML_TYPE_F32);
 
     ggml_tensor * qf = ggml_cast(ctx, q, GGML_TYPE_F32);
@@ -242,11 +288,13 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
     std::vector<float> flash_out;
 
     case_result res = {};
+    res.reference = (compare == cli_options::compare_mode::flash) ? "flash" : "sageattention";
+    res.ref_val = std::numeric_limits<float>::quiet_NaN();
+    res.sage_val = std::numeric_limits<float>::quiet_NaN();
     res.sage_ms = run_graph(ctx, backend, sage_f32, sage_out);
     res.flash_ms = run_graph(ctx, backend, flash, flash_out);
     res.max_index = 0;
     res.sage_val = 0.0f;
-    res.flash_val = 0.0f;
 
     auto has_non_finite = [](const std::vector<float> & vals) {
         for (float v : vals) {
@@ -257,13 +305,24 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
         return false;
     };
 
-    if (has_non_finite(sage_out) || has_non_finite(flash_out)) {
+    bool ref_has_non_finite = false;
+    const std::vector<float> * ref_output = nullptr;
+    if (compare == cli_options::compare_mode::flash) {
+        ref_output = &flash_out;
+        ref_has_non_finite = has_non_finite(*ref_output);
+    } else {
+        GGML_ASSERT(ext && ext->has_ref_sage);
+        ref_output = &ext->ref_sage;
+        ref_has_non_finite = has_non_finite(*ref_output);
+    }
+
+    if (has_non_finite(sage_out) || ref_has_non_finite) {
         const bool sage_bad = has_non_finite(sage_out);
-        const bool flash_bad = has_non_finite(flash_out);
+        const bool ref_bad = ref_has_non_finite;
         printf("WARNING[%s]: non-finite outputs detected (sage=%d, flash=%d)\n",
                cfg.name.c_str(),
                sage_bad ? 1 : 0,
-               flash_bad ? 1 : 0);
+               ref_bad ? 1 : 0);
         if (sage_bad) {
             for (size_t i = 0; i < sage_out.size(); ++i) {
                 if (!std::isfinite(sage_out[i])) {
@@ -279,19 +338,20 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
         double max_abs = 0.0;
         size_t max_idx = 0;
         for (size_t i = 0; i < sage_out.size(); ++i) {
-            const double diff = (double) sage_out[i] - (double) flash_out[i];
+            const double diff = (double) sage_out[i] - (double) (*ref_output)[i];
             const double abs_diff = std::abs(diff);
             if (abs_diff > max_abs) {
                 max_abs = abs_diff;
                 max_idx = i;
                 res.sage_val = sage_out[i];
-                res.flash_val = flash_out[i];
+                res.ref_val = (*ref_output)[i];
             }
             sum_sq += diff*diff;
         }
         res.max_diff = max_abs;
         res.max_index = max_idx;
         res.rms_diff = std::sqrt(sum_sq / sage_out.size());
+        res.ref_val = (*ref_output)[max_idx];
     }
 
     ggml_backend_buffer_free(buffer);
@@ -310,6 +370,7 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
 static case_result run_case_iters(const sage_case & cfg, ggml_backend_t backend, uint64_t seed_base, int iters) {
     GGML_ASSERT(iters > 0);
     case_result agg = {};
+    agg.reference = "flash";
     double sage_sum = 0.0;
     double flash_sum = 0.0;
     double rms_sum = 0.0;
@@ -318,7 +379,7 @@ static case_result run_case_iters(const sage_case & cfg, ggml_backend_t backend,
 
     for (int it = 0; it < iters; ++it) {
         const uint64_t seed = seed_base + (uint64_t) it * 10007ull;
-        const case_result cur = run_case(cfg, backend, seed);
+        const case_result cur = run_case(cfg, backend, seed, nullptr, nullptr, nullptr, cli_options::compare_mode::flash);
         sage_sum += cur.sage_ms;
         flash_sum += cur.flash_ms;
         rms_sum += cur.rms_diff;
@@ -326,7 +387,8 @@ static case_result run_case_iters(const sage_case & cfg, ggml_backend_t backend,
             max_diff = cur.max_diff;
             agg.max_index = cur.max_index;
             agg.sage_val = cur.sage_val;
-            agg.flash_val = cur.flash_val;
+            agg.ref_val = cur.ref_val;
+            agg.reference = cur.reference;
             max_init = true;
         }
     }
@@ -346,16 +408,27 @@ static const char * granularity_name(ggml_sage_qk_granularity gran) {
     }
 }
 
+static const char * pv_accum_name(ggml_sage_pv_accum pv) {
+    switch (pv) {
+        case GGML_SAGE_PV_ACCUM_FP32:        return "fp32";
+        case GGML_SAGE_PV_ACCUM_FP32_FP32:   return "fp32+fp32";
+        case GGML_SAGE_PV_ACCUM_FP32_FP16:   return "fp32+fp16";
+        default:                             return "unknown";
+    }
+}
+
 static void print_case_report(const sage_case & cfg, const case_result & res, int iters, bool verbose) {
     const double speedup = (res.sage_ms > 0.0) ? (res.flash_ms / res.sage_ms) : 0.0;
     printf("\nCase %s\n", cfg.name.c_str());
-    printf("  shape: batch=%d seq_q=%d seq_k=%d nq=%d nk=%d d=%d causal=%d smooth_k=%d\n",
+    printf("  shape: batch=%d seq_q=%d seq_k=%d nq=%d nk=%d d=%d causal=%d smooth_k=%d smooth_v=%d pv=%s\n",
            cfg.batch, cfg.seq_q, cfg.seq_k, cfg.num_q_heads, cfg.num_k_heads, cfg.head_dim,
-           cfg.is_causal ? 1 : 0, cfg.smooth_k ? 1 : 0);
+           cfg.is_causal ? 1 : 0, cfg.smooth_k ? 1 : 0,
+           cfg.smooth_v ? 1 : 0, pv_accum_name(cfg.pv_accum));
     printf("  granularity: %s\n", granularity_name(cfg.granularity));
     printf("  iterations: %d\n", iters);
     printf("  timings (avg): sage %.3f ms, flash %.3f ms (speedup %.2fx)\n", res.sage_ms, res.flash_ms, speedup);
-    printf("  diff: max %.3e rms_avg %.3e\n", res.max_diff, res.rms_diff);
+    printf("  reference: %s\n", res.reference.c_str());
+    printf("  diff (%s): max %.3e rms_avg %.3e\n", res.reference.c_str(), res.max_diff, res.rms_diff);
     if (verbose && std::isfinite(res.max_diff)) {
         size_t idx = res.max_index;
         const int64_t dim = cfg.head_dim;
@@ -369,13 +442,13 @@ static void print_case_report(const sage_case & cfg, const case_result & res, in
         int64_t d2 = idx % heads;
         idx /= heads;
         int64_t d3 = idx;
-        printf("  worst element: batch=%lld head=%lld seq=%lld dim=%lld (sage=%e flash=%e)\n",
+        printf("  worst element: batch=%lld head=%lld seq=%lld dim=%lld (sage=%e ref=%e)\n",
                (long long) d3,
                (long long) d2,
                (long long) d1,
                (long long) d0,
                (double) res.sage_val,
-               (double) res.flash_val);
+               (double) res.ref_val);
     }
 }
 
@@ -389,6 +462,11 @@ static void print_usage(const char * prog) {
     printf("  --list              List available case names and exit.\n");
     printf("  --verbose           Print additional per-case diagnostics (worst element info).\n");
     printf("  --load <prefix>     Load tensors from files generated by compare_sageattention.py.\n");
+    printf("  --granularity per_warp|per_thread  Override Sage quantization granularity.\n");
+    printf("  --smooth-k / --no-smooth-k  Override key smoothing flag.\n");
+    printf("  --smooth-v / --no-smooth-v  Override value smoothing flag.\n");
+    printf("  --pv-accum fp32|fp32+fp32|fp32+fp16  Override PV accumulation mode.\n");
+    printf("  --compare flash|sage      Select reference for error metrics (default flash).\n");
     printf("  -h, --help          Show this help message.\n");
 }
 
@@ -449,6 +527,58 @@ static bool parse_cli(int argc, char ** argv, cli_options & opts) {
                 return false;
             }
             opts.load_prefix = argv[++i];
+        } else if (arg == "--granularity") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--granularity requires a value (per_warp or per_thread)\n");
+                return false;
+            }
+            std::string val = argv[++i];
+            if (val == "per_warp") {
+                opts.granularity_override = GGML_SAGE_QK_GRANULARITY_PER_WARP;
+            } else if (val == "per_thread") {
+                opts.granularity_override = GGML_SAGE_QK_GRANULARITY_PER_THREAD;
+            } else {
+                fprintf(stderr, "unknown granularity '%s'\n", val.c_str());
+                return false;
+            }
+            opts.granularity_override_set = true;
+        } else if (arg == "--smooth-k") {
+            opts.smooth_k_override_set = true;
+            opts.smooth_k_override = true;
+        } else if (arg == "--no-smooth-k") {
+            opts.smooth_k_override_set = true;
+            opts.smooth_k_override = false;
+        } else if (arg == "--smooth-v") {
+            opts.smooth_v_override_set = true;
+            opts.smooth_v_override = true;
+        } else if (arg == "--no-smooth-v") {
+            opts.smooth_v_override_set = true;
+            opts.smooth_v_override = false;
+        } else if (arg == "--pv-accum") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--pv-accum requires a value (fp32, fp32+fp32, fp32+fp16)\n");
+                return false;
+            }
+            std::string val = argv[++i];
+            if (!parse_pv_accum_string(val, opts.pv_accum_override)) {
+                fprintf(stderr, "unknown pv-accum '%s'\n", val.c_str());
+                return false;
+            }
+            opts.pv_accum_override_set = true;
+        } else if (arg == "--compare") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--compare requires a value (flash or sage)\n");
+                return false;
+            }
+            std::string val = argv[++i];
+            if (val == "flash") {
+                opts.compare = cli_options::compare_mode::flash;
+            } else if (val == "sage") {
+                opts.compare = cli_options::compare_mode::sage;
+            } else {
+                fprintf(stderr, "unknown compare target '%s'\n", val.c_str());
+                return false;
+            }
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             return false;
@@ -481,13 +611,16 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<sage_case> cases = {
-        {"b2_seq256_d128", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_WARP},
-        {"b1_causal_seq128_d64", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_WARP},
-        {"b1_causal_seq128_d64_nosmooth", 64, 128, 128, 12, 6, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
-        {"b4_seq512_d128", 128, 512, 512, 8, 4, 4, false, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
-        {"b1_long_seq768_d128_causal", 128, 768, 768, 4, 4, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP},
-        {"b2_seq256_d128_thread", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD},
-        {"b1_causal_seq128_d64_thread", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD},
+        {"b2_seq256_d128", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b1_causal_seq128_d64", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b1_causal_seq128_d64_nosmooth", 64, 128, 128, 12, 6, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b4_seq512_d128", 128, 512, 512, 8, 4, 4, false, false, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b1_long_seq768_d128_causal", 128, 768, 768, 4, 4, 1, true, false, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b2_seq256_d128_thread", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b1_causal_seq128_d64_thread", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_THREAD, false, GGML_SAGE_PV_ACCUM_FP32_FP16},
+        {"b1_causal_seq128_d64_smoothv", 64, 128, 128, 12, 6, 1, true, true, GGML_SAGE_QK_GRANULARITY_PER_WARP, true, GGML_SAGE_PV_ACCUM_FP32},
+        {"b2_seq256_d128_fp32", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32},
+        {"b2_seq256_d128_fp32fp32", 128, 256, 256, 16, 8, 2, false, true, GGML_SAGE_QK_GRANULARITY_PER_WARP, false, GGML_SAGE_PV_ACCUM_FP32_FP32},
     };
 
     external_data loaded;
@@ -500,6 +633,34 @@ int main(int argc, char ** argv) {
         loaded.cfg.name = opts.load_prefix;
         cases = { loaded.cfg };
         opts.case_filters.clear();
+    }
+
+    if (opts.compare == cli_options::compare_mode::sage && !loaded.active) {
+        fprintf(stderr, "--compare sage requires --load with sage reference tensors\n");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    auto apply_overrides = [&](sage_case & cfg) {
+        if (opts.granularity_override_set) {
+            cfg.granularity = opts.granularity_override;
+        }
+        if (opts.smooth_k_override_set) {
+            cfg.smooth_k = opts.smooth_k_override;
+        }
+        if (opts.smooth_v_override_set) {
+            cfg.smooth_v = opts.smooth_v_override;
+        }
+        if (opts.pv_accum_override_set) {
+            cfg.pv_accum = opts.pv_accum_override;
+        }
+    };
+
+    if (loaded.active) {
+        apply_overrides(loaded.cfg);
+    }
+    for (auto & cfg : cases) {
+        apply_overrides(cfg);
     }
 
     if (opts.list_only) {
@@ -559,7 +720,7 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "warning: overriding iters to 1 for loaded case\n");
                 opts.iters = 1;
             }
-            res = run_case(*entry.cfg, backend, opts.seed, &loaded, &exported_sage, &exported_flash);
+            res = run_case(*entry.cfg, backend, opts.seed, &loaded, &exported_sage, &exported_flash, opts.compare);
         } else {
             const uint64_t seed = opts.seed + (uint64_t) entry.index * 1000003ull;
             res = run_case_iters(*entry.cfg, backend, seed, opts.iters);

@@ -99,14 +99,17 @@ def verify_fp8(case_prefix: Path, dump_prefix: Path, meta: dict) -> Tuple[float,
     batch = meta["batch"]
     head_dim_padded = 64 if head_dim <= 64 else 128
     kv_len_padded = ((seq_k + 63) // 64) * 64
+    smooth_v = bool(meta.get("smooth_v", 0))
+    pv_accum = meta.get("pv_accum", "fp32+fp16")
+    scale_max = 2.25 if pv_accum == "fp32+fp16" else 448.0
 
     v = load_tensor(case_prefix, "v", np.float16, (head_dim, seq_k, num_k_heads, batch))
     v = np.transpose(v, (3, 2, 1, 0))  # (b, h, seq, dim)
     v_t = torch.from_numpy(v.copy()).cuda()
 
     with torch.inference_mode():
-        v_fp8_ref, v_scale_ref, _ = per_channel_fp8(
-            v_t, tensor_layout="HND", scale_max=2.25, smooth_v=False
+        v_fp8_ref, v_scale_ref, vm = per_channel_fp8(
+            v_t, tensor_layout="HND", scale_max=scale_max, smooth_v=smooth_v
         )
 
     v_fp8_ref_bytes = v_fp8_ref.view(torch.int8).cpu().numpy()
@@ -125,7 +128,14 @@ def verify_fp8(case_prefix: Path, dump_prefix: Path, meta: dict) -> Tuple[float,
 
     print(f"[fp8] scale max diff: {v_scale_diff}")
     print(f"[fp8] payload max diff: {v_fp8_diff}")
-    return float(v_scale_diff), float(v_fp8_diff)
+    v_mean_diff = 0.0
+    if smooth_v:
+        v_mean_dump = np.fromfile(dump_prefix.with_suffix(".v_mean.bin"), dtype=np.float32)
+        v_mean_dump = v_mean_dump.reshape(batch, num_k_heads, head_dim_padded)
+        v_mean_ref = vm.cpu().numpy()
+        v_mean_diff = np.max(np.abs(v_mean_dump[:, :, :head_dim] - v_mean_ref))
+        print(f"[fp8] mean max diff: {v_mean_diff}")
+    return float(v_scale_diff), float(v_fp8_diff), float(v_mean_diff)
 
 
 def main():
@@ -136,9 +146,9 @@ def main():
 
     meta = read_meta(args.case_prefix.with_suffix(".meta"))
     transpose_diff = verify_transpose(args.case_prefix, args.dump_prefix, meta)
-    scale_diff, fp8_diff = verify_fp8(args.case_prefix, args.dump_prefix, meta)
+    scale_diff, fp8_diff, mean_diff = verify_fp8(args.case_prefix, args.dump_prefix, meta)
 
-    if transpose_diff == scale_diff == fp8_diff == 0.0:
+    if transpose_diff == scale_diff == fp8_diff == mean_diff == 0.0:
         print("All checks passed.")
     else:
         print("Differences detected; see metrics above.")

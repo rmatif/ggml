@@ -59,6 +59,8 @@ def main():
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--granularity", choices=["per_warp", "per_thread"], default="per_warp")
     parser.add_argument("--sm-scale", type=float, default=None)
+    parser.add_argument("--pv-accum", choices=["fp32", "fp32+fp32", "fp32+fp16"], default="fp32+fp16")
+    parser.add_argument("--smooth-v", action="store_true")
     args = parser.parse_args()
 
     head_dim = args.head_dim
@@ -80,26 +82,34 @@ def main():
     k_scale = load_scale(args.dump_prefix.with_suffix(".k_scale.bin"), (args.batch, args.num_k_heads, k_scale_cols))
 
     v_scale = load_scale(args.dump_prefix.with_suffix(".v_scale.bin"), (args.batch, args.num_k_heads, head_dim_padded))
+    v_mean = None
+    if args.smooth_v:
+        if args.pv_accum != "fp32":
+            raise SystemExit("--smooth-v currently supported only with --pv-accum=fp32")
+        v_mean = load_scale(args.dump_prefix.with_suffix(".v_mean.bin"), (args.batch, args.num_k_heads, head_dim_padded))
 
     sm_scale = args.sm_scale
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim ** 0.5)
 
     out = torch.zeros(args.batch, args.num_q_heads, args.seq_q, head_dim_padded, dtype=torch.float16, device="cuda")
-    torch.ops.sageattention_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
-        q_int8,
-        k_int8,
-        v_fp8,
-        out,
-        q_scale,
-        k_scale,
-        v_scale,
-        tensor_layout_flag,
-        1 if args.causal else 0,
-        q_gran,
-        sm_scale,
-        0,
-    )
+    if args.pv_accum == "fp32":
+        if args.smooth_v:
+            kernel = torch.ops.sageattention_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn
+            kernel(q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale, v_mean,
+                   tensor_layout_flag, 1 if args.causal else 0, q_gran, sm_scale, 0)
+        else:
+            kernel = torch.ops.sageattention_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn
+            kernel(q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
+                   tensor_layout_flag, 1 if args.causal else 0, q_gran, sm_scale, 0)
+    elif args.pv_accum == "fp32+fp32":
+        kernel = torch.ops.sageattention_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf
+        kernel(q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
+               tensor_layout_flag, 1 if args.causal else 0, q_gran, sm_scale, 0)
+    else:
+        kernel = torch.ops.sageattention_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf
+        kernel(q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
+               tensor_layout_flag, 1 if args.causal else 0, q_gran, sm_scale, 0)
 
     out = out.cpu().numpy()[..., :head_dim]
     ref = np.fromfile(args.case_prefix.with_suffix(".sage.bin"), dtype=np.float32).reshape(head_dim, args.seq_q, args.num_q_heads, args.batch)

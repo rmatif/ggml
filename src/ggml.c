@@ -5154,6 +5154,8 @@ struct ggml_tensor * ggml_sage_attn_sm89_fp16(
         float                 softmax_scale,
         bool                  is_causal,
         bool                  smooth_k,
+        bool                  smooth_v,
+        enum ggml_sage_pv_accum pv_accum,
         enum ggml_sage_qk_granularity quant_granularity) {
     GGML_ASSERT(q->type == k->type && q->type == v->type);
     GGML_ASSERT(q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_BF16);
@@ -5163,6 +5165,9 @@ struct ggml_tensor * ggml_sage_attn_sm89_fp16(
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
     GGML_ASSERT(quant_granularity == GGML_SAGE_QK_GRANULARITY_PER_WARP ||
                 quant_granularity == GGML_SAGE_QK_GRANULARITY_PER_THREAD);
+    GGML_ASSERT(pv_accum == GGML_SAGE_PV_ACCUM_FP32 ||
+                pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP32 ||
+                pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP16);
 
     int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, 4, ne);
@@ -5171,11 +5176,15 @@ struct ggml_tensor * ggml_sage_attn_sm89_fp16(
         float    scale;
         int32_t  is_causal;
         int32_t  smooth_k;
+        int32_t  smooth_v;
+        int32_t  pv_accum;
         int32_t  quant_granularity;
     } params = {
         softmax_scale,
         is_causal ? 1 : 0,
         smooth_k ? 1 : 0,
+        smooth_v ? 1 : 0,
+        (int32_t) pv_accum,
         (int32_t) quant_granularity,
     };
 

@@ -432,6 +432,12 @@ extern "C" {
         GGML_SAGE_QK_GRANULARITY_PER_THREAD = 3,
     };
 
+    enum ggml_sage_pv_accum {
+        GGML_SAGE_PV_ACCUM_FP32          = 0,
+        GGML_SAGE_PV_ACCUM_FP32_FP32     = 1,
+        GGML_SAGE_PV_ACCUM_FP32_FP16     = 2,
+    };
+
     // model file types
     enum ggml_ftype {
         GGML_FTYPE_UNKNOWN        = -1,
@@ -2261,14 +2267,16 @@ extern "C" {
         struct ggml_tensor * sinks);
 
     GGML_API struct ggml_tensor * ggml_sage_attn_sm89_fp16(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        float                 softmax_scale,
-        bool                  is_causal,
-        bool                  smooth_k,
-        enum ggml_sage_qk_granularity quant_granularity);
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 softmax_scale,
+            bool                  is_causal,
+            bool                  smooth_k,
+            bool                  smooth_v,
+            enum ggml_sage_pv_accum pv_accum,
+            enum ggml_sage_qk_granularity quant_granularity);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

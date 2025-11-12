@@ -99,6 +99,8 @@ def dump_case(prefix: str, case: Case, q, k, v, out_sage, out_flash, smooth_v: b
         f"batch {case.batch}",
         f"is_causal {int(case.is_causal)}",
         f"smooth_k {int(case.smooth_k)}",
+        f"smooth_v {int(smooth_v)}",
+        f"pv_accum {pv_accum}",
         f"granularity {case.granularity}",
     ]
     (base.with_suffix(".meta")).write_text("\n".join(meta_lines) + "\n")
