@@ -2649,10 +2649,6 @@ if (dump_prefix) {
 }
 
     bool smooth_v = smooth_v_param;
-    if (smooth_v && pv_accum != GGML_SAGE_PV_ACCUM_FP32) {
-        GGML_LOG_WARN("ggml_cuda_sage_attn_sm89_fp16: smooth_v requires pv_accum=FP32; disabling\n");
-        smooth_v = false;
-    }
     const bool use_pv_fp16_accum = (pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP16);
     const float v_scale_max = use_pv_fp16_accum ? FP8_SCALE_MAX_FP16 : FP8_SCALE_MAX_FP32;
 

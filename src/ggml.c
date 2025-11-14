@@ -1,6 +1,10 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
@@ -9,6 +13,114 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+
+static bool ggml_sage_str_ieq(const char * a, const char * b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char) *a;
+        unsigned char cb = (unsigned char) *b;
+        if (tolower(ca) != tolower(cb)) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static bool ggml_sage_env_parse_bool(const char * val, bool * out) {
+    if (val == NULL || out == NULL) {
+        return false;
+    }
+    if (val[0] == '1' || val[0] == 't' || val[0] == 'T' || val[0] == 'y' || val[0] == 'Y') {
+        *out = true;
+        return true;
+    }
+    if (val[0] == '0' || val[0] == 'f' || val[0] == 'F' || val[0] == 'n' || val[0] == 'N') {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_sage_env_override_bool(const char * name, bool * init, bool * has_value, bool * value) {
+    if (!*init) {
+        *init = true;
+        const char * env = getenv(name);
+        if (env != NULL) {
+            bool tmp = false;
+            if (ggml_sage_env_parse_bool(env, &tmp)) {
+                *has_value = true;
+                *value = tmp;
+            } else {
+                GGML_LOG_WARN("ggml_sage_attn_sm89_fp16: invalid value '%s' for %s (expected 0/1/true/false)\n", env, name);
+            }
+        }
+    }
+    return *has_value;
+}
+
+static bool ggml_sage_env_override_pv(enum ggml_sage_pv_accum * out) {
+    static bool pv_init = false;
+    static bool pv_has = false;
+    static enum ggml_sage_pv_accum pv_value = GGML_SAGE_PV_ACCUM_FP32_FP16;
+    if (!pv_init) {
+        pv_init = true;
+        const char * env = getenv("GGML_SAGE_PV_ACCUM");
+        if (env != NULL) {
+            if (ggml_sage_str_ieq(env, "fp32")) {
+                pv_value = GGML_SAGE_PV_ACCUM_FP32;
+                pv_has = true;
+            } else if (ggml_sage_str_ieq(env, "fp32+fp32")) {
+                pv_value = GGML_SAGE_PV_ACCUM_FP32_FP32;
+                pv_has = true;
+            } else if (ggml_sage_str_ieq(env, "fp32+fp16")) {
+                pv_value = GGML_SAGE_PV_ACCUM_FP32_FP16;
+                pv_has = true;
+            } else {
+                GGML_LOG_WARN("ggml_sage_attn_sm89_fp16: invalid GGML_SAGE_PV_ACCUM='%s' (expected fp32, fp32+fp32, fp32+fp16)\n", env);
+            }
+        }
+    }
+    if (pv_has) {
+        *out = pv_value;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_sage_env_apply_bool(const char * prop, const char * env_name, bool * init, bool * has_value, bool * value, bool * target, bool * logged) {
+    if (ggml_sage_env_override_bool(env_name, init, has_value, value)) {
+        if (!*logged) {
+            GGML_LOG_INFO("ggml_sage_attn_sm89_fp16: overriding %s via %s=%d\n", prop, env_name, *value ? 1 : 0);
+            *logged = true;
+        }
+        *target = *value;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_sage_env_smooth_k_init = false;
+static bool ggml_sage_env_smooth_k_has = false;
+static bool ggml_sage_env_smooth_k_value = false;
+static bool ggml_sage_env_smooth_k_logged = false;
+
+static bool ggml_sage_env_smooth_v_init = false;
+static bool ggml_sage_env_smooth_v_has = false;
+static bool ggml_sage_env_smooth_v_value = false;
+static bool ggml_sage_env_smooth_v_logged = false;
+
+static bool ggml_sage_env_pv_logged = false;
+static bool ggml_sage_env_smooth_v_warned = false;
+
+static const char * ggml_sage_pv_accum_to_str(enum ggml_sage_pv_accum pv) {
+    switch (pv) {
+        case GGML_SAGE_PV_ACCUM_FP32:         return "fp32";
+        case GGML_SAGE_PV_ACCUM_FP32_FP32:    return "fp32+fp32";
+        case GGML_SAGE_PV_ACCUM_FP32_FP16:    return "fp32+fp16";
+    }
+    return "unknown";
+}
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -5169,6 +5281,42 @@ struct ggml_tensor * ggml_sage_attn_sm89_fp16(
                 pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP32 ||
                 pv_accum == GGML_SAGE_PV_ACCUM_FP32_FP16);
 
+    bool smooth_k_cfg = smooth_k;
+    bool smooth_v_cfg = smooth_v;
+    enum ggml_sage_pv_accum pv_accum_cfg = pv_accum;
+
+    ggml_sage_env_apply_bool("smooth_k", "GGML_SAGE_SMOOTH_K",
+            &ggml_sage_env_smooth_k_init,
+            &ggml_sage_env_smooth_k_has,
+            &ggml_sage_env_smooth_k_value,
+            &smooth_k_cfg,
+            &ggml_sage_env_smooth_k_logged);
+
+    ggml_sage_env_apply_bool("smooth_v", "GGML_SAGE_SMOOTH_V",
+            &ggml_sage_env_smooth_v_init,
+            &ggml_sage_env_smooth_v_has,
+            &ggml_sage_env_smooth_v_value,
+            &smooth_v_cfg,
+            &ggml_sage_env_smooth_v_logged);
+
+    enum ggml_sage_pv_accum pv_env = pv_accum_cfg;
+    if (ggml_sage_env_override_pv(&pv_env)) {
+        if (!ggml_sage_env_pv_logged) {
+            GGML_LOG_INFO("ggml_sage_attn_sm89_fp16: overriding pv_accum via GGML_SAGE_PV_ACCUM=%s\n",
+                    ggml_sage_pv_accum_to_str(pv_env));
+            ggml_sage_env_pv_logged = true;
+        }
+        pv_accum_cfg = pv_env;
+    }
+
+    if (smooth_v_cfg && pv_accum_cfg != GGML_SAGE_PV_ACCUM_FP32) {
+        if (!ggml_sage_env_smooth_v_warned) {
+            GGML_LOG_WARN("ggml_sage_attn_sm89_fp16: smooth_v requires pv_accum=fp32; forcing smooth_v=0\n");
+            ggml_sage_env_smooth_v_warned = true;
+        }
+        smooth_v_cfg = false;
+    }
+
     int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, 4, ne);
 
@@ -5182,9 +5330,9 @@ struct ggml_tensor * ggml_sage_attn_sm89_fp16(
     } params = {
         softmax_scale,
         is_causal ? 1 : 0,
-        smooth_k ? 1 : 0,
-        smooth_v ? 1 : 0,
-        (int32_t) pv_accum,
+        smooth_k_cfg ? 1 : 0,
+        smooth_v_cfg ? 1 : 0,
+        (int32_t) pv_accum_cfg,
         (int32_t) quant_granularity,
     };
 

@@ -186,6 +186,11 @@ static bool load_binary(const std::string & path, std::vector<T> & data, size_t 
     return true;
 }
 
+// Legacy SageAttention dumps store tensors with the fastest-moving dimension
+// being `dim`, followed by seq, head, batch (DSHB). GGML (and the rest of
+// this harness) expects `[batch, head, seq, dim]`. The difference silently
+// produces ~0.39 RMS errors that look like kernel bugs, so keep the conversion
+// and be vocal whenever we have to fall back to it.
 static void convert_dsbh_to_bhsd(std::vector<float> & data, int head_dim, int seq, int heads, int batch) {
     if (data.empty()) {
         return;
@@ -231,6 +236,11 @@ static bool load_external_case(const std::string & prefix, external_data & ext) 
     if (ext.has_ref_sage_quant) {
         // already stored in BHSd order
     } else if (ext.has_ref_sage) {
+        fprintf(stderr,
+                "[test-sageflash] warning: %s missing .sage_quant.bin; converting legacy layout "
+                "(expect ~0.39 RMS vs float refs if not regenerated; this is NOT an accuracy bug — "
+                "regenerate dumps via compare_sageattention.py)\n",
+                prefix.c_str());
         convert_dsbh_to_bhsd(ext.ref_sage, cfg.head_dim, cfg.seq_q, cfg.num_q_heads, cfg.batch);
     }
     if (ext.has_ref_flash) {
@@ -505,6 +515,8 @@ static void print_usage(const char * prog) {
     printf("  --pv-accum fp32|fp32+fp32|fp32+fp16  Override PV accumulation mode.\n");
     printf("  --compare flash|sage      Select reference for error metrics (default flash).\n");
     printf("  -h, --help          Show this help message.\n");
+    printf("\nEnvironment overrides:\n");
+    printf("  GGML_SAGE_SMOOTH_K=0|1, GGML_SAGE_SMOOTH_V=0|1, GGML_SAGE_PV_ACCUM=fp32|fp32+fp32|fp32+fp16\n");
 }
 
 static std::vector<std::string> split_case_list(const std::string & csv) {

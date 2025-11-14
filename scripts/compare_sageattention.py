@@ -1,6 +1,6 @@
 import argparse
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Tuple
 
@@ -126,6 +126,7 @@ def main():
     parser.add_argument("--case", choices=[c.name for c in CASES], help="Case to run")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smooth-v", action="store_true", help="Enable V smoothing when supported")
+    parser.add_argument("--granularity", choices=["per_warp", "per_thread"], help="Override quantization granularity")
     parser.add_argument(
         "--pv-accum",
         default="fp32+fp16",
@@ -136,6 +137,8 @@ def main():
     args = parser.parse_args()
 
     case = next(c for c in CASES if c.name == args.case)
+    if args.granularity:
+        case = replace(case, granularity=args.granularity)
     max_diff, rms, idx, sage_val, flash_val, q, k, v, out_sage, out_flash = run_case(
         case, args.seed, args.smooth_v, args.pv_accum
     )

@@ -24,7 +24,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Tuple
 
@@ -105,7 +105,7 @@ def run_ggml_case(ggml_bin: Path, prefix: Path) -> HarnessResult:
 
 
 def ensure_clean(prefix: Path) -> None:
-    for suffix in [".meta", ".q.bin", ".k.bin", ".v.bin", ".sage.bin", ".flash.bin"]:
+    for suffix in [".meta", ".q.bin", ".k.bin", ".v.bin", ".sage.bin", ".sage_quant.bin", ".flash.bin"]:
         path = prefix.with_suffix(suffix)
         if path.exists():
             path.unlink()
@@ -119,6 +119,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed.")
     parser.add_argument("--smooth-v", action="store_true", help="Enable V smoothing when generating reference tensors.")
     parser.add_argument(
+        "--granularity",
+        choices=["per_warp", "per_thread"],
+        help="Override SageAttention quantization granularity.",
+    )
+    parser.add_argument(
         "--pv-accum",
         default="fp32+fp16",
         choices=["fp32", "fp32+fp32", "fp32+fp16"],
@@ -129,6 +134,8 @@ def main() -> None:
     args = parser.parse_args()
 
     case = parse_case(args.case)
+    if args.granularity:
+        case = replace(case, granularity=args.granularity)
     ggml_bin = Path(args.ggml_bin)
     if not ggml_bin.exists():
         raise FileNotFoundError(f"ggml binary not found: {ggml_bin}")
