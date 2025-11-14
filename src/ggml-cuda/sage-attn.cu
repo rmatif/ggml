@@ -589,6 +589,47 @@ void convert_dshb_to_bhsd_host(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+template<typename T>
+__global__ void convert_dshb_to_bhsd_kernel(
+        const T * __restrict__ src,
+        T * __restrict__ dst,
+        int head_dim,
+        int seq_len,
+        int heads,
+        int batch) {
+    const size_t total = (size_t) head_dim * seq_len * heads * batch;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) blockDim.x * gridDim.x) {
+        const int d = idx % head_dim;
+        size_t tmp = idx / head_dim;
+        const int s = tmp % seq_len;
+        tmp /= seq_len;
+        const int h = tmp % heads;
+        const int b = tmp / heads;
+        const size_t dst_index = (((size_t) b * heads + h) * seq_len + s) * head_dim + d;
+        dst[dst_index] = src[idx];
+    }
+}
+
+template<typename T>
+void convert_dshb_to_bhsd_device(
+        const T * src,
+        T * dst,
+        int head_dim,
+        int seq_len,
+        int heads,
+        int batch,
+        cudaStream_t stream) {
+    const size_t total = (size_t) head_dim * seq_len * heads * batch;
+    if (total == 0) {
+        return;
+    }
+    const int threads = 256;
+    const int blocks = (int) ((total + threads - 1) / threads);
+    convert_dshb_to_bhsd_kernel<T><<<blocks, threads, 0, stream>>>(
+        src, dst, head_dim, seq_len, heads, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool sage_force_simple_quant() {
     static bool value = getenv("GGML_SAGE_FORCE_SIMPLE_QK") != nullptr;
     return value;
@@ -596,6 +637,11 @@ static bool sage_force_simple_quant() {
 
 static bool sage_force_host_quant() {
     static bool value = getenv("GGML_SAGE_FORCE_HOST_QK") != nullptr;
+    return value;
+}
+
+static bool sage_force_host_permute() {
+    static bool value = getenv("GGML_SAGE_FORCE_HOST_PERMUTE") != nullptr;
     return value;
 }
 
@@ -1564,7 +1610,7 @@ static inline int sage_fp8_permute_token_host(int token) {
 }
 
 template<typename T, int HEAD_DIM>
-void transpose_pad_permute(
+void transpose_pad_permute_host(
         const T * input,
         T * output,
         int batch,
@@ -1610,6 +1656,63 @@ void transpose_pad_permute(
 
     CUDA_CHECK(cudaMemcpyAsync(output, host_out.data(), out_elems * sizeof(T), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+template<typename T, int HEAD_DIM>
+__global__ void transpose_pad_permute_kernel(
+        const T * __restrict__ input,
+        T * __restrict__ output,
+        int batch,
+        int heads,
+        int seq_len,
+        int padded_seq_len) {
+    const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) blockDim.x * gridDim.x) {
+        const int token = idx % padded_seq_len;
+        size_t tmp = idx / padded_seq_len;
+        const int d = tmp % HEAD_DIM;
+        tmp /= HEAD_DIM;
+        const int h = tmp % heads;
+        const int b = tmp / heads;
+
+        T val = T(0);
+        if (token < seq_len) {
+            const size_t src_index =
+                d +
+                (size_t) HEAD_DIM * (
+                    token +
+                    (size_t) seq_len * (
+                        h +
+                        (size_t) heads * b));
+            val = input[src_index];
+        }
+
+        const int permuted = sage_fp8_permute_token(token);
+        const size_t dst_index =
+            ((((size_t) b * heads + h) * HEAD_DIM + d) * padded_seq_len) + permuted;
+        output[dst_index] = val;
+    }
+}
+
+template<typename T, int HEAD_DIM>
+void transpose_pad_permute_device(
+        const T * input,
+        T * output,
+        int batch,
+        int heads,
+        int seq_len,
+        int padded_seq_len,
+        cudaStream_t stream) {
+    const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
+    if (total == 0) {
+        return;
+    }
+    const int threads = 256;
+    int blocks = (int) ((total + threads - 1) / threads);
+    blocks = std::min(blocks, 65535);
+    transpose_pad_permute_kernel<T, HEAD_DIM><<<blocks, threads, 0, stream>>>(
+        input, output, batch, heads, seq_len, padded_seq_len);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template<typename T, bool SUB_MEAN>
@@ -1965,14 +2068,25 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         q_pad_dims, q_pad_strides,
         q_padded.get(),
         stream);
-    convert_dshb_to_bhsd_host(
-        q_padded.get(),
-        q_contig.get(),
-        head_dim_padded,
-        qo_len,
-        num_q_heads,
-        batch,
-        stream);
+    if (sage_force_host_permute()) {
+        convert_dshb_to_bhsd_host(
+            q_padded.get(),
+            q_contig.get(),
+            head_dim_padded,
+            qo_len,
+            num_q_heads,
+            batch,
+            stream);
+    } else {
+        convert_dshb_to_bhsd_device(
+            q_padded.get(),
+            q_contig.get(),
+            head_dim_padded,
+            qo_len,
+            num_q_heads,
+            batch,
+            stream);
+    }
     if (dump_prefix) {
         sage_debug_dump(dump_prefix, "q_f16", q_padded.get(),
             (size_t) q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch * sizeof(T),
@@ -1988,14 +2102,25 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         k_pad_dims, k_pad_strides,
         k_padded.get(),
         stream);
-    convert_dshb_to_bhsd_host(
-        k_padded.get(),
-        k_contig.get(),
-        head_dim_padded,
-        kv_len,
-        num_k_heads,
-        batch,
-        stream);
+    if (sage_force_host_permute()) {
+        convert_dshb_to_bhsd_host(
+            k_padded.get(),
+            k_contig.get(),
+            head_dim_padded,
+            kv_len,
+            num_k_heads,
+            batch,
+            stream);
+    } else {
+        convert_dshb_to_bhsd_device(
+            k_padded.get(),
+            k_contig.get(),
+            head_dim_padded,
+            kv_len,
+            num_k_heads,
+            batch,
+            stream);
+    }
     if (dump_prefix) {
         sage_debug_dump(dump_prefix, "k_f16", k_padded.get(),
             (size_t) k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch * sizeof(T),
@@ -2637,10 +2762,18 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<T> v_transposed(pool, (size_t) batch * num_k_heads * head_dim_padded * kv_len_padded);
     switch (head_dim_padded) {
         case 64:
-            transpose_pad_permute<T, 64>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            if (sage_force_host_permute()) {
+                transpose_pad_permute_host<T, 64>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            } else {
+                transpose_pad_permute_device<T, 64>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            }
             break;
         case 128:
-            transpose_pad_permute<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            if (sage_force_host_permute()) {
+                transpose_pad_permute_host<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            } else {
+                transpose_pad_permute_device<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+            }
             break;
     }
 if (dump_prefix) {
