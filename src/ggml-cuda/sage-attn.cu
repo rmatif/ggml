@@ -630,6 +630,78 @@ void convert_dshb_to_bhsd_device(
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<typename T>
+__global__ void copy_pad_tensor_to_bhsd_kernel(
+        const T * __restrict__ src,
+        T * __restrict__ dst,
+        uint32_t stride_batch_src,
+        uint32_t stride_head_src,
+        uint32_t stride_seq_src,
+        int head_dim_src,
+        int head_dim_dst,
+        int seq_len_src,
+        int seq_len_dst,
+        int heads,
+        int batch) {
+    const size_t total = (size_t) head_dim_dst * seq_len_dst * heads * batch;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) blockDim.x * gridDim.x) {
+        const int d = idx % head_dim_dst;
+        size_t tmp = idx / head_dim_dst;
+        const int s = tmp % seq_len_dst;
+        tmp /= seq_len_dst;
+        const int h = tmp % heads;
+        const int b = tmp / heads;
+
+        T val = T(0);
+        if (s < seq_len_src && d < head_dim_src) {
+            const size_t src_index =
+                (size_t) b * stride_batch_src +
+                (size_t) h * stride_head_src +
+                (size_t) s * stride_seq_src +
+                d;
+            val = src[src_index];
+        }
+
+        const size_t dst_index =
+            (((size_t) b * heads + h) * seq_len_dst + s) * head_dim_dst + d;
+        dst[dst_index] = val;
+    }
+}
+
+template<typename T>
+void copy_pad_tensor_to_bhsd(
+        const T * src,
+        const tensor_dims & dims,
+        const tensor_strides & strides,
+        int head_dim_padded,
+        T * dst,
+        cudaStream_t stream) {
+    const int head_dim_src = dims.head_dim;
+    const int seq_len = dims.seq_len;
+    const int heads = dims.heads;
+    const int batch = dims.batch;
+    if (head_dim_padded <= 0 || seq_len == 0 || heads == 0 || batch == 0) {
+        return;
+    }
+    const size_t total = (size_t) head_dim_padded * seq_len * heads * batch;
+    const int threads = 256;
+    int blocks = (int) ((total + threads - 1) / threads);
+    blocks = std::min(blocks, 65535);
+    copy_pad_tensor_to_bhsd_kernel<T><<<blocks, threads, 0, stream>>>(
+        src,
+        dst,
+        to_u32(strides.stride_batch),
+        to_u32(strides.stride_head),
+        to_u32(strides.stride_seq),
+        head_dim_src,
+        head_dim_padded,
+        seq_len,
+        seq_len,
+        heads,
+        batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool sage_force_simple_quant() {
     static bool value = getenv("GGML_SAGE_FORCE_SIMPLE_QK") != nullptr;
     return value;
@@ -1659,13 +1731,17 @@ void transpose_pad_permute_host(
 }
 
 template<typename T, int HEAD_DIM>
-__global__ void transpose_pad_permute_kernel(
-        const T * __restrict__ input,
-        T * __restrict__ output,
-        int batch,
-        int heads,
+__global__ void transpose_pad_permute_strided_kernel(
+        const T * __restrict__ src,
+        T * __restrict__ dst,
+        uint32_t stride_batch,
+        uint32_t stride_head,
+        uint32_t stride_seq,
+        int head_dim_src,
         int seq_len,
-        int padded_seq_len) {
+        int padded_seq_len,
+        int heads,
+        int batch) {
     const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) blockDim.x * gridDim.x) {
         const int token = idx % padded_seq_len;
@@ -1676,32 +1752,32 @@ __global__ void transpose_pad_permute_kernel(
         const int b = tmp / heads;
 
         T val = T(0);
-        if (token < seq_len) {
+        if (token < seq_len && d < head_dim_src) {
             const size_t src_index =
-                d +
-                (size_t) HEAD_DIM * (
-                    token +
-                    (size_t) seq_len * (
-                        h +
-                        (size_t) heads * b));
-            val = input[src_index];
+                (size_t) b * stride_batch +
+                (size_t) h * stride_head +
+                (size_t) token * stride_seq +
+                d;
+            val = src[src_index];
         }
 
         const int permuted = sage_fp8_permute_token(token);
         const size_t dst_index =
             ((((size_t) b * heads + h) * HEAD_DIM + d) * padded_seq_len) + permuted;
-        output[dst_index] = val;
+        dst[dst_index] = val;
     }
 }
 
 template<typename T, int HEAD_DIM>
-void transpose_pad_permute_device(
+void transpose_pad_permute_strided(
         const T * input,
-        T * output,
+        const tensor_strides & strides,
+        int head_dim_src,
         int batch,
         int heads,
         int seq_len,
         int padded_seq_len,
+        T * output,
         cudaStream_t stream) {
     const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
     if (total == 0) {
@@ -1710,8 +1786,17 @@ void transpose_pad_permute_device(
     const int threads = 256;
     int blocks = (int) ((total + threads - 1) / threads);
     blocks = std::min(blocks, 65535);
-    transpose_pad_permute_kernel<T, HEAD_DIM><<<blocks, threads, 0, stream>>>(
-        input, output, batch, heads, seq_len, padded_seq_len);
+    transpose_pad_permute_strided_kernel<T, HEAD_DIM><<<blocks, threads, 0, stream>>>(
+        input,
+        output,
+        to_u32(strides.stride_batch),
+        to_u32(strides.stride_head),
+        to_u32(strides.stride_seq),
+        head_dim_src,
+        seq_len,
+        padded_seq_len,
+        heads,
+        batch);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2041,9 +2126,9 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const tensor_strides k_pad_strides = make_contiguous_strides(k_pad_dims);
     const tensor_strides v_pad_strides = make_contiguous_strides(v_pad_dims);
     ggml_cuda_pool & pool = ctx.pool();
-    ggml_cuda_pool_alloc<T> q_padded(pool, q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch);
-    ggml_cuda_pool_alloc<T> k_padded(pool, k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch);
-    ggml_cuda_pool_alloc<T> v_padded(pool, v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch);
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> q_padded;
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> k_padded;
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> v_padded;
     const int batch = q_dims.batch;
     const int num_q_heads = q_dims.heads;
     const int num_k_heads = k_dims.heads;
@@ -2062,33 +2147,28 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<T> q_contig(pool, (size_t) batch * num_q_heads * qo_len * head_dim_padded);
     ggml_cuda_pool_alloc<T> k_contig(pool, (size_t) batch * num_k_heads * kv_len * head_dim_padded);
 
-    copy_pad_tensor(
-        static_cast<const T *>(q->data),
-        q_dims, q_strides,
-        q_pad_dims, q_pad_strides,
-        q_padded.get(),
-        stream);
-    if (sage_force_host_permute()) {
-        convert_dshb_to_bhsd_host(
-            q_padded.get(),
-            q_contig.get(),
-            head_dim_padded,
-            qo_len,
-            num_q_heads,
-            batch,
-            stream);
-    } else {
-        convert_dshb_to_bhsd_device(
-            q_padded.get(),
-            q_contig.get(),
-            head_dim_padded,
-            qo_len,
-            num_q_heads,
-            batch,
+    const bool need_q_pad = dump_prefix != nullptr || debug_quant_host;
+    T * q_padded_ptr = nullptr;
+    if (need_q_pad) {
+        q_padded = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch);
+        q_padded_ptr = q_padded->get();
+        copy_pad_tensor(
+            static_cast<const T *>(q->data),
+            q_dims, q_strides,
+            q_pad_dims, q_pad_strides,
+            q_padded_ptr,
             stream);
     }
-    if (dump_prefix) {
-        sage_debug_dump(dump_prefix, "q_f16", q_padded.get(),
+
+    copy_pad_tensor_to_bhsd(
+        static_cast<const T *>(q->data),
+        q_dims,
+        q_strides,
+        head_dim_padded,
+        q_contig.get(),
+        stream);
+    if (dump_prefix && q_padded_ptr) {
+        sage_debug_dump(dump_prefix, "q_f16", q_padded_ptr,
             (size_t) q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch * sizeof(T),
             stream);
         sage_debug_dump(dump_prefix, "q_bhsd", q_contig.get(),
@@ -2096,33 +2176,28 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             stream);
     }
 
-    copy_pad_tensor(
-        static_cast<const T *>(k->data),
-        k_dims, k_strides,
-        k_pad_dims, k_pad_strides,
-        k_padded.get(),
-        stream);
-    if (sage_force_host_permute()) {
-        convert_dshb_to_bhsd_host(
-            k_padded.get(),
-            k_contig.get(),
-            head_dim_padded,
-            kv_len,
-            num_k_heads,
-            batch,
-            stream);
-    } else {
-        convert_dshb_to_bhsd_device(
-            k_padded.get(),
-            k_contig.get(),
-            head_dim_padded,
-            kv_len,
-            num_k_heads,
-            batch,
+    const bool need_k_pad = dump_prefix != nullptr || debug_quant_host;
+    T * k_padded_ptr = nullptr;
+    if (need_k_pad) {
+        k_padded = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch);
+        k_padded_ptr = k_padded->get();
+        copy_pad_tensor(
+            static_cast<const T *>(k->data),
+            k_dims, k_strides,
+            k_pad_dims, k_pad_strides,
+            k_padded_ptr,
             stream);
     }
-    if (dump_prefix) {
-        sage_debug_dump(dump_prefix, "k_f16", k_padded.get(),
+
+    copy_pad_tensor_to_bhsd(
+        static_cast<const T *>(k->data),
+        k_dims,
+        k_strides,
+        head_dim_padded,
+        k_contig.get(),
+        stream);
+    if (dump_prefix && k_padded_ptr) {
+        sage_debug_dump(dump_prefix, "k_f16", k_padded_ptr,
             (size_t) k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch * sizeof(T),
             stream);
         sage_debug_dump(dump_prefix, "k_bhsd", k_contig.get(),
@@ -2130,15 +2205,23 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             stream);
     }
 
-    copy_pad_tensor(
-        static_cast<const T *>(v->data),
-        v_dims, v_strides,
-        v_pad_dims, v_pad_strides,
-        v_padded.get(),
-        stream);
-    sage_debug_dump(dump_prefix, "v_f16", v_padded.get(),
-        (size_t) v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch * sizeof(T),
-        stream);
+    const bool need_v_pad = dump_prefix != nullptr || sage_force_host_permute();
+    T * v_padded_ptr = nullptr;
+    if (need_v_pad) {
+        v_padded = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch);
+        v_padded_ptr = v_padded->get();
+        copy_pad_tensor(
+            static_cast<const T *>(v->data),
+            v_dims, v_strides,
+            v_pad_dims, v_pad_strides,
+            v_padded_ptr,
+            stream);
+    }
+    if (dump_prefix && v_padded_ptr) {
+        sage_debug_dump(dump_prefix, "v_f16", v_padded_ptr,
+            (size_t) v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch * sizeof(T),
+            stream);
+    }
     sage_kernel_debug_q q_kernel_debug = {};
     size_t q_kernel_debug_slots = 0;
     std::unique_ptr<ggml_cuda_pool_alloc<uint32_t>> dbg_q_token_storage;
@@ -2367,10 +2450,10 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             sage_debug_dump(dump_prefix, "q_amax", q_amax_dev.get(), q_scale_elems * sizeof(float), stream);
         }
     }
-    if ((debug_quant && sage_force_simple_quant()) || debug_quant_host) {
+    if (((debug_quant && sage_force_simple_quant()) || debug_quant_host) && q_padded_ptr) {
         fprintf(stderr, "SAGE_Q_SIMPLE host check start\n");
         debug_compare_q_scale_host(
-            q_padded.get(),
+            q_padded_ptr,
             q_pad_dims,
             q_scale.get(),
             q_scale_cols,
@@ -2604,10 +2687,10 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
     const size_t k_scale_elems = (size_t) batch * num_k_heads * k_scale_cols;
-    if ((debug_quant && sage_force_simple_quant()) || debug_quant_host) {
+    if (((debug_quant && sage_force_simple_quant()) || debug_quant_host) && k_padded_ptr) {
         fprintf(stderr, "SAGE_K_SIMPLE host check start\n");
         debug_compare_k_scale_host(
-            k_padded.get(),
+            k_padded_ptr,
             k_pad_dims,
             k_scale.get(),
             k_scale_cols,
@@ -2763,16 +2846,36 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (head_dim_padded) {
         case 64:
             if (sage_force_host_permute()) {
-                transpose_pad_permute_host<T, 64>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+                GGML_ASSERT(v_padded_ptr != nullptr);
+                transpose_pad_permute_host<T, 64>(v_padded_ptr, v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
             } else {
-                transpose_pad_permute_device<T, 64>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+                transpose_pad_permute_strided<T, 64>(
+                    static_cast<const T *>(v->data),
+                    v_strides,
+                    v_dims.head_dim,
+                    batch,
+                    num_k_heads,
+                    kv_len,
+                    kv_len_padded,
+                    v_transposed.get(),
+                    stream);
             }
             break;
         case 128:
             if (sage_force_host_permute()) {
-                transpose_pad_permute_host<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+                GGML_ASSERT(v_padded_ptr != nullptr);
+                transpose_pad_permute_host<T, 128>(v_padded_ptr, v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
             } else {
-                transpose_pad_permute_device<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
+                transpose_pad_permute_strided<T, 128>(
+                    static_cast<const T *>(v->data),
+                    v_strides,
+                    v_dims.head_dim,
+                    batch,
+                    num_k_heads,
+                    kv_len,
+                    kv_len_padded,
+                    v_transposed.get(),
+                    stream);
             }
             break;
     }
