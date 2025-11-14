@@ -1742,30 +1742,66 @@ __global__ void transpose_pad_permute_strided_kernel(
         int padded_seq_len,
         int heads,
         int batch) {
-    const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) blockDim.x * gridDim.x) {
-        const int token = idx % padded_seq_len;
-        size_t tmp = idx / padded_seq_len;
-        const int d = tmp % HEAD_DIM;
-        tmp /= HEAD_DIM;
-        const int h = tmp % heads;
-        const int b = tmp / heads;
+    constexpr uint32_t CTA_SIZE = CTA_TRANSPOSE;
+    constexpr uint32_t pack_size = 8;
+    const uint32_t num_threads_per_token = HEAD_DIM / pack_size;
+    const uint32_t num_threads_per_cta = CTA_SIZE / pack_size;
 
-        T val = T(0);
-        if (token < seq_len && d < head_dim_src) {
-            const size_t src_index =
-                (size_t) b * stride_batch +
-                (size_t) h * stride_head +
-                (size_t) token * stride_seq +
-                d;
-            val = src[src_index];
-        }
+    const uint32_t bx = blockIdx.x;
+    const uint32_t head_id = blockIdx.y;
+    const uint32_t batch_id = blockIdx.z;
+    const uint32_t thread_id = threadIdx.x;
 
-        const int permuted = sage_fp8_permute_token(token);
-        const size_t dst_index =
-            ((((size_t) b * heads + h) * HEAD_DIM + d) * padded_seq_len) + permuted;
-        dst[dst_index] = val;
+    const uint32_t token_base = bx * CTA_SIZE;
+    const uint32_t local_token = thread_id / num_threads_per_token;
+    const uint32_t token = token_base + local_token;
+    const uint32_t dim_lane = (thread_id % num_threads_per_token) * pack_size;
+
+    const T * input_ptr_base = src +
+        (size_t) batch_id * stride_batch +
+        (size_t) head_id * stride_head +
+        (size_t) token * stride_seq +
+        dim_lane;
+
+    T * output_ptr_base = dst +
+        (((size_t) batch_id * heads + head_id) * (size_t) padded_seq_len * HEAD_DIM) +
+        dim_lane;
+
+    __shared__ T shared_load[CTA_SIZE][HEAD_DIM];
+    __shared__ T shared_store[HEAD_DIM][CTA_SIZE];
+
+    const uint32_t smem_load_row_base = ((thread_id/num_threads_per_token)/16)*16;
+    const uint32_t smem_load_row_mod = (thread_id/num_threads_per_token) % 16;
+    const uint32_t smem_load_row = smem_load_row_base
+        + (smem_load_row_mod/8)*2
+        + ((smem_load_row_mod/2) % 4)*4
+        + (smem_load_row_mod % 2);
+
+    const bool pred = (token < (uint32_t) seq_len) && (dim_lane < (uint32_t) head_dim_src);
+
+    cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, cp_async::SharedMemFillMode::kFillZero>(
+        shared_load[smem_load_row] + (thread_id % num_threads_per_token)*pack_size,
+        input_ptr_base,
+        pred);
+    cp_async::commit_group();
+    cp_async::wait_group<0>();
+    __syncthreads();
+
+    const uint32_t smem_row_base = thread_id % CTA_SIZE;
+    const uint32_t smem_col_base = thread_id / CTA_SIZE;
+    const uint32_t smem_col_stride = HEAD_DIM / 8;
+
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        shared_store[smem_col_base + i*smem_col_stride][smem_row_base] =
+            shared_load[smem_row_base][smem_col_base + i*smem_col_stride];
     }
+    __syncthreads();
+
+    const uint32_t permuted = sage_fp8_permute_token(token);
+    T * out_ptr = output_ptr_base + (size_t) permuted * HEAD_DIM;
+    *(float4*)(out_ptr) =
+        *(float4*)(&shared_store[thread_id/num_threads_per_cta][(thread_id % num_threads_per_cta)*pack_size]);
 }
 
 template<typename T, int HEAD_DIM>
@@ -1779,14 +1815,14 @@ void transpose_pad_permute_strided(
         int padded_seq_len,
         T * output,
         cudaStream_t stream) {
-    const size_t total = (size_t) batch * heads * HEAD_DIM * padded_seq_len;
-    if (total == 0) {
+    if (batch == 0 || heads == 0 || padded_seq_len == 0) {
         return;
     }
-    const int threads = 256;
-    int blocks = (int) ((total + threads - 1) / threads);
-    blocks = std::min(blocks, 65535);
-    transpose_pad_permute_strided_kernel<T, HEAD_DIM><<<blocks, threads, 0, stream>>>(
+    const int threads = CTA_TRANSPOSE * (HEAD_DIM / 8);
+    const int blocks_x = (int) div_ceil64(padded_seq_len, CTA_TRANSPOSE);
+    dim3 grid(blocks_x, heads, batch);
+    dim3 block(threads);
+    transpose_pad_permute_strided_kernel<T, HEAD_DIM><<<grid, block, 0, stream>>>(
         input,
         output,
         to_u32(strides.stride_batch),
