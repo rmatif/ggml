@@ -168,32 +168,32 @@ __global__ void quant_int8_kernel(
                batch_id, head_id, bx, token_start, BLOCK_SIZE, s_amax);
 #endif
 
-        if (dbg.token_start != nullptr && dbg.stride != 0) {
-            const size_t scale_index = scale_ptr_base - scale;
-            dbg.token_start[scale_index] = thread_base_token;
-            if (dbg.amax) {
-                dbg.amax[scale_index] = s_amax;
-            }
-            if (dbg.scale) {
-                dbg.scale[scale_index] = scale_ptr_base[0];
-            }
-            if (dbg.samples && dbg.sample_stride != 0) {
-                const size_t sample_offset = scale_index * dbg.sample_stride;
-                half * dst_samples = dbg.samples + sample_offset;
-                const uint32_t token_start_blk = thread_base_token;
-                const uint32_t token_end_blk = min(token_start_blk + BLOCK_SIZE, num_tokens);
-                const uint32_t tokens_to_copy = min((uint32_t)(dbg.sample_stride / head_dim), token_end_blk - token_start_blk);
-                // copy raw values for the configured number of tokens in this block
-                for (uint32_t tok = 0; tok < tokens_to_copy; ++tok) {
-                    const uint32_t src_token = token_start_blk + tok;
-                    const T * src_ptr = input + batch_id*stride_bz_input + head_id*stride_h_input + src_token*stride_seq_input;
-                    for (uint32_t d = 0; d < head_dim; ++d) {
-                        const float val = convert_to_float(src_ptr[d]);
-                        dst_samples[tok*head_dim + d] = __float2half(val);
-                    }
+    if (thread_id == 0 && dbg.token_start != nullptr && dbg.stride != 0) {
+        const size_t scale_index = scale_ptr_base - scale;
+        const uint32_t block_token = bx * BLOCK_SIZE;
+        dbg.token_start[scale_index] = block_token;
+        if (dbg.amax) {
+            dbg.amax[scale_index] = s_amax;
+        }
+        if (dbg.scale) {
+            dbg.scale[scale_index] = scale_ptr_base[0];
+        }
+        if (dbg.samples && dbg.sample_stride != 0) {
+            const size_t sample_offset = scale_index * dbg.sample_stride;
+            half * dst_samples = dbg.samples + sample_offset;
+            const uint32_t token_start_blk = block_token;
+            const uint32_t token_end_blk = min(token_start_blk + BLOCK_SIZE, num_tokens);
+            const uint32_t tokens_to_copy = min((uint32_t)(dbg.sample_stride / head_dim), token_end_blk - token_start_blk);
+            for (uint32_t tok = 0; tok < tokens_to_copy; ++tok) {
+                const uint32_t src_token = token_start_blk + tok;
+                const T * src_ptr = input + batch_id*stride_bz_input + head_id*stride_h_input + src_token*stride_seq_input;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const float val = convert_to_float(src_ptr[d]);
+                    dst_samples[tok*head_dim + d] = __float2half(val);
                 }
             }
         }
+    }
     }
     __syncthreads();
 

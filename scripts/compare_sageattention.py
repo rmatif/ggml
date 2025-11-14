@@ -2,6 +2,7 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -87,6 +88,11 @@ def run_case(case: Case, seed: int, smooth_v: bool, pv_accum: str):
     return max_diff, rms, max_index, sage_val, flash_val, q, k, v, out_sage, out_flash
 
 
+def save_tensor(prefix: str, name: str, tensor: torch.Tensor, dtype: torch.dtype, permute: Tuple[int, ...]):
+    arr = tensor.permute(*permute).contiguous().to(dtype).cpu().numpy()
+    np.asarray(arr).tofile(f"{prefix}.{name}.bin")
+
+
 def dump_case(prefix: str, case: Case, q, k, v, out_sage, out_flash, smooth_v: bool, pv_accum: str):
     base = Path(prefix)
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -105,15 +111,13 @@ def dump_case(prefix: str, case: Case, q, k, v, out_sage, out_flash, smooth_v: b
     ]
     (base.with_suffix(".meta")).write_text("\n".join(meta_lines) + "\n")
 
-    def save_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype):
-        arr = tensor.permute(3, 2, 1, 0).contiguous().to(dtype).cpu().numpy()
-        np.asarray(arr).tofile(f"{prefix}.{name}.bin")
-
-    save_tensor("q", q, torch.float16)
-    save_tensor("k", k, torch.float16)
-    save_tensor("v", v, torch.float16)
-    save_tensor("sage", out_sage, torch.float32)
-    save_tensor("flash", out_flash, torch.float32)
+    save_tensor(prefix, "q", q, torch.float16, (3, 2, 1, 0))
+    save_tensor(prefix, "k", k, torch.float16, (3, 2, 1, 0))
+    save_tensor(prefix, "v", v, torch.float16, (3, 2, 1, 0))
+    save_tensor(prefix, "sage", out_sage, torch.float32, (3, 2, 1, 0))
+    save_tensor(prefix, "flash", out_flash, torch.float32, (3, 2, 1, 0))
+    # store an additional reference in BHSd order for direct comparisons
+    np.asarray(out_sage.contiguous().to(torch.float32).cpu().numpy()).tofile(f"{prefix}.sage_quant.bin")
     print(f"  dumped tensors to {prefix}.*")
 
 

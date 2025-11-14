@@ -24,8 +24,7 @@ def load_int8_tensor(path: Path, head_dim: int, seq: int, heads: int, batch: int
     expected = head_dim * seq * heads * batch
     if data.size != expected:
         raise ValueError(f"unexpected size for {path} (got {data.size}, expected {expected})")
-    data = data.reshape(head_dim, seq, heads, batch)
-    tensor = torch.from_numpy(np.ascontiguousarray(np.transpose(data, (3, 2, 1, 0)))).cuda()
+    tensor = torch.from_numpy(data.reshape(batch, heads, seq, head_dim)).cuda()
     return tensor
 
 

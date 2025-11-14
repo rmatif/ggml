@@ -326,8 +326,276 @@ void trim_tensor_head_dim(
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<typename T>
+__global__ void permute_dshb_to_bhsd_kernel(
+        const T * __restrict__ src,
+        T * __restrict__ dst,
+        int head_dim,
+        int seq_len,
+        int heads,
+        int batch) {
+    const int64_t total = (int64_t) batch * heads * seq_len * head_dim;
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    int64_t tmp = idx;
+    const int dim = tmp % head_dim;
+    tmp /= head_dim;
+    const int seq = tmp % seq_len;
+    tmp /= seq_len;
+    const int head = tmp % heads;
+    const int batch_id = tmp / heads;
+
+    const int64_t src_idx =
+        ((int64_t) dim) +
+        (int64_t) head_dim * (
+            seq +
+            (int64_t) seq_len * (
+                head +
+                (int64_t) heads * batch_id));
+
+    const int64_t dst_idx =
+        (((int64_t) batch_id * heads + head) * seq_len + seq) * head_dim + dim;
+
+    dst[dst_idx] = src[src_idx];
+}
+
+template<typename T>
+void permute_dshb_to_bhsd(
+        const T * src,
+        T * dst,
+        int head_dim,
+        int seq_len,
+        int heads,
+        int batch,
+        cudaStream_t stream) {
+    const int64_t total = (int64_t) batch * heads * seq_len * head_dim;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    permute_dshb_to_bhsd_kernel<<<blocks, threads, 0, stream>>>(
+        src, dst, head_dim, seq_len, heads, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename T>
+static float to_float_host(T v);
+
+template<>
+float to_float_host<half>(half v) {
+    return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(&v));
+}
+
+template<>
+float to_float_host<nv_bfloat16>(nv_bfloat16 v) {
+    return ggml_bf16_to_fp32(*reinterpret_cast<const ggml_bf16_t *>(&v));
+}
+
+inline int8_t quantize_scalar(float val, float inv_scale) {
+    const float clipped = std::max(-127.0f, std::min(127.0f, std::nearbyint(val * inv_scale)));
+    return (int8_t) clipped;
+}
+
+template<typename T>
+void quantize_q_per_warp_host(
+        const T * src_dev,
+        int8_t * dst_dev,
+        float * scale_dev,
+        int batch,
+        int heads,
+        int seq_len,
+        int head_dim,
+        cudaStream_t stream) {
+    const int warps_per_block = BLKQ / WARPQ;
+    const int num_blocks = (seq_len + BLKQ - 1) / BLKQ;
+    const size_t elems = (size_t) batch * heads * seq_len * head_dim;
+    std::vector<T> host_in(elems);
+    CUDA_CHECK(cudaMemcpyAsync(host_in.data(), src_dev, elems * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<int8_t> host_out(elems, 0);
+    std::vector<float> host_scale((size_t) batch * heads * num_blocks * warps_per_block, 0.0f);
+
+    auto value_at = [&](int b, int h, int t, int d) -> float {
+        const size_t idx = (((size_t) b * heads + h) * seq_len + t) * head_dim + d;
+        return to_float_host(host_in[idx]);
+    };
+
+    auto out_index = [&](int b, int h, int t, int d) -> size_t {
+        return (((size_t) b * heads + h) * seq_len + t) * head_dim + d;
+    };
+
+    const float eps = 1e-7f;
+
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int block = 0; block < num_blocks; ++block) {
+                for (int warp = 0; warp < warps_per_block; ++warp) {
+                    float max_abs = eps;
+                    for (int token = 0; token < WARPQ; ++token) {
+                        const int t = block*BLKQ + warp*WARPQ + token;
+                        if (t >= seq_len) {
+                            break;
+                        }
+                        for (int d = 0; d < head_dim; ++d) {
+                            const float v = value_at(b, h, t, d);
+                            max_abs = std::max(max_abs, fabsf(v));
+                        }
+                    }
+                    const float inv_scale = 127.0f / max_abs;
+                    const float scale_val = max_abs / 127.0f;
+                    host_scale[(((size_t) b * heads + h) * num_blocks + block) * warps_per_block + warp] = scale_val;
+                    for (int token = 0; token < WARPQ; ++token) {
+                        const int t = block*BLKQ + warp*WARPQ + token;
+                        if (t >= seq_len) {
+                            break;
+                        }
+                        for (int d = 0; d < head_dim; ++d) {
+                            const float v = value_at(b, h, t, d);
+                            host_out[out_index(b, h, t, d)] = quantize_scalar(v, inv_scale);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(dst_dev, host_out.data(), elems * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(scale_dev, host_scale.data(),
+        host_scale.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+template<typename T>
+void quantize_k_per_block_host(
+        const T * src_dev,
+        const T * mean_dev,
+        int8_t * dst_dev,
+        float * scale_dev,
+        int batch,
+        int heads,
+        int seq_len,
+        int head_dim,
+        cudaStream_t stream) {
+    const int num_blocks = (seq_len + BLKK - 1) / BLKK;
+    const size_t elems = (size_t) batch * heads * seq_len * head_dim;
+    std::vector<T> host_in(elems);
+    CUDA_CHECK(cudaMemcpyAsync(host_in.data(), src_dev, elems * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<int8_t> host_out(elems, 0);
+    std::vector<float> host_scale((size_t) batch * heads * num_blocks, 0.0f);
+
+    std::vector<float> host_mean;
+    auto mean_at = [&](int b, int h, int d) -> float {
+        if (mean_dev == nullptr) return 0.0f;
+        const size_t idx = (((size_t) b * heads + h) * head_dim) + d;
+        return host_mean[idx];
+    };
+    if (mean_dev != nullptr) {
+        host_mean.resize((size_t) batch * heads * head_dim);
+        CUDA_CHECK(cudaMemcpyAsync(host_mean.data(), mean_dev,
+            host_mean.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    auto value_at = [&](int b, int h, int t, int d) -> float {
+        const size_t idx = (((size_t) b * heads + h) * seq_len + t) * head_dim + d;
+        return to_float_host(host_in[idx]);
+    };
+    auto out_index = [&](int b, int h, int t, int d) -> size_t {
+        return (((size_t) b * heads + h) * seq_len + t) * head_dim + d;
+    };
+
+    const float eps = 1e-7f;
+
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int block = 0; block < num_blocks; ++block) {
+                float max_abs = eps;
+                for (int token = 0; token < BLKK; ++token) {
+                    const int t = block*BLKK + token;
+                    if (t >= seq_len) break;
+                    for (int d = 0; d < head_dim; ++d) {
+                        float v = value_at(b, h, t, d);
+                        if (mean_dev != nullptr) {
+                            v -= mean_at(b, h, d);
+                        }
+                        max_abs = std::max(max_abs, fabsf(v));
+                    }
+                }
+                const float inv_scale = 127.0f / max_abs;
+                const float scale_val = max_abs / 127.0f;
+                host_scale[((size_t) b * heads + h) * num_blocks + block] = scale_val;
+                for (int token = 0; token < BLKK; ++token) {
+                    const int t = block*BLKK + token;
+                    if (t >= seq_len) break;
+                    for (int d = 0; d < head_dim; ++d) {
+                        float v = value_at(b, h, t, d);
+                        if (mean_dev != nullptr) {
+                            v -= mean_at(b, h, d);
+                        }
+                        host_out[out_index(b, h, t, d)] = quantize_scalar(v, inv_scale);
+                    }
+                }
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(dst_dev, host_out.data(), elems * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(scale_dev, host_scale.data(),
+        host_scale.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+template<typename T>
+void convert_dshb_to_bhsd_host(
+        const T * src,
+        T * dst,
+        int head_dim,
+        int seq_len,
+        int heads,
+        int batch,
+        cudaStream_t stream) {
+    const size_t elems = (size_t) head_dim * seq_len * heads * batch;
+    std::vector<T> host_in(elems);
+    std::vector<T> host_out(elems);
+
+    CUDA_CHECK(cudaMemcpyAsync(host_in.data(), src, elems * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int64_t stride_dim = (int64_t) seq_len * heads * batch;
+    const int64_t stride_seq = (int64_t) heads * batch;
+    const int64_t stride_head = batch;
+    const int64_t stride_batch = 1;
+
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int s = 0; s < seq_len; ++s) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const size_t src_index =
+                        d*stride_dim +
+                        s*stride_seq +
+                        h*stride_head +
+                        b*stride_batch;
+                    const size_t dst_index =
+                        (((size_t) b * heads + h) * seq_len + s) * head_dim + d;
+                    host_out[dst_index] = host_in[src_index];
+                }
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(dst, host_out.data(), elems * sizeof(T), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 static bool sage_force_simple_quant() {
     static bool value = getenv("GGML_SAGE_FORCE_SIMPLE_QK") != nullptr;
+    return value;
+}
+
+static bool sage_force_host_quant() {
+    static bool value = getenv("GGML_SAGE_FORCE_HOST_QK") != nullptr;
     return value;
 }
 
@@ -460,7 +728,8 @@ void quantize_k_per_block(
         int batch,
         int heads,
         int seq_len,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const ggml_cuda_sage::quant_debug_config & dbg = {}) {
     if (sage_force_simple_quant()) {
         fprintf(stderr, "SAGE: using simple quant for K\n");
         quantize_k_per_block_simple<T, HEAD_DIM, SUB_MEAN>(
@@ -497,7 +766,7 @@ void quantize_k_per_block(
             to_u32(stride_batch_mean), to_u32(stride_head_mean),
             to_u32(stride_batch), to_u32(stride_seq), to_u32(stride_head),
             to_u32(stride_batch_scale), to_u32(stride_head_scale),
-            {});
+            dbg);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1272,6 +1541,28 @@ void quantize_k_per_thread(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__device__ __forceinline__ int sage_fp8_permute_token(int token) {
+    const int low = token & 0xF;
+    const int high = token & ~0xF;
+    const int b0 = low & 1;
+    const int b1 = (low >> 1) & 1;
+    const int b2 = (low >> 2) & 1;
+    const int b3 = (low >> 3) & 1;
+    const int new_low = b0 | (b3 << 1) | (b1 << 2) | (b2 << 3);
+    return high | new_low;
+}
+
+static inline int sage_fp8_permute_token_host(int token) {
+    const int low = token & 0xF;
+    const int high = token & ~0xF;
+    const int b0 = low & 1;
+    const int b1 = (low >> 1) & 1;
+    const int b2 = (low >> 2) & 1;
+    const int b3 = (low >> 3) & 1;
+    const int new_low = b0 | (b3 << 1) | (b1 << 2) | (b2 << 3);
+    return high | new_low;
+}
+
 template<typename T, int HEAD_DIM>
 void transpose_pad_permute(
         const T * input,
@@ -1281,33 +1572,48 @@ void transpose_pad_permute(
         int seq_len,
         int padded_seq_len,
         cudaStream_t stream) {
-    constexpr int CTA_SIZE = CTA_TRANSPOSE;
-    const int padded = ((seq_len + CTA_SIZE - 1) / CTA_SIZE) * CTA_SIZE;
+    const int padded = ((seq_len + CTA_TRANSPOSE - 1) / CTA_TRANSPOSE) * CTA_TRANSPOSE;
     GGML_ASSERT(padded == padded_seq_len);
 
-    const int64_t stride_seq_in = HEAD_DIM;
-    const int64_t stride_head_in = HEAD_DIM * seq_len;
-    const int64_t stride_batch_in = stride_head_in * heads;
+    const size_t in_elems = (size_t) HEAD_DIM * seq_len * heads * batch;
+    const size_t out_elems = (size_t) HEAD_DIM * padded_seq_len * heads * batch;
 
-    const int64_t stride_d_out = padded_seq_len;
-    const int64_t stride_head_out = HEAD_DIM * stride_d_out;
-    const int64_t stride_batch_out = heads * stride_head_out;
+    std::vector<T> host_in(in_elems);
+    std::vector<T> host_out(out_elems, T(0));
 
-    dim3 grid(padded_seq_len / CTA_SIZE, heads, batch);
-    dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+    CUDA_CHECK(cudaMemcpyAsync(host_in.data(), input, in_elems * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    ggml_cuda_sage::transpose_pad_permute_kernel<HEAD_DIM, CTA_SIZE, true, T>
-        <<<grid, block, 0, stream>>>(
-            const_cast<T *>(input),
-            output,
-            seq_len,
-            to_u32(stride_batch_in), to_u32(stride_seq_in), to_u32(stride_head_in),
-            to_u32(stride_batch_out), to_u32(stride_d_out), to_u32(stride_head_out));
-    CUDA_CHECK(cudaGetLastError());
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                for (int token = 0; token < padded_seq_len; ++token) {
+                    T val = T(0);
+                    if (token < seq_len) {
+                        const size_t src_index =
+                            d +
+                            (size_t) HEAD_DIM * (
+                                token +
+                                (size_t) seq_len * (
+                                    h +
+                                    (size_t) heads * b));
+                        val = host_in[src_index];
+                    }
+                    const int permuted = sage_fp8_permute_token_host(token);
+                    const size_t dst_index =
+                        (((size_t) b * heads + h) * HEAD_DIM + d) * padded_seq_len + permuted;
+                    host_out[dst_index] = val;
+                }
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(output, host_out.data(), out_elems * sizeof(T), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-template<typename T, int HEAD_DIM, bool SUB_MEAN>
-void quantize_v_to_fp8(
+template<typename T, bool SUB_MEAN>
+void quantize_v_per_channel(
         T * input,
         int8_t * output,
         float * mean,
@@ -1317,28 +1623,27 @@ void quantize_v_to_fp8(
         int heads,
         int head_dim,
         int seq_len,
+        int seq_len_padded,
         cudaStream_t stream) {
-    constexpr int CTA_SIZE = 256;
-
-    const int64_t stride_d = seq_len;
-    const int64_t stride_head = head_dim * stride_d;
+    const int64_t stride_dim = seq_len_padded;
+    const int64_t stride_head = head_dim * stride_dim;
     const int64_t stride_batch = heads * stride_head;
 
-    const int64_t stride_head_scale = head_dim;
     const int64_t stride_batch_scale = heads * head_dim;
+    const int64_t stride_head_scale = head_dim;
 
     dim3 grid(heads, batch, head_dim);
-    dim3 block(CTA_SIZE);
+    dim3 block(256);
 
     ggml_cuda_sage::mean_scale_kernel<64, SUB_MEAN, T><<<grid, block, 0, stream>>>(
         input,
         output,
-        mean,
+        SUB_MEAN ? mean : nullptr,
         scale,
         scale_max,
         seq_len,
-        to_u32(stride_batch), to_u32(stride_d), to_u32(stride_head),
-        to_u32(stride_batch), to_u32(stride_d), to_u32(stride_head),
+        to_u32(stride_batch), to_u32(stride_dim), to_u32(stride_head),
+        to_u32(stride_batch), to_u32(stride_dim), to_u32(stride_head),
         SUB_MEAN ? to_u32(stride_batch_scale) : 0,
         SUB_MEAN ? to_u32(stride_head_scale) : 0,
         to_u32(stride_batch_scale), to_u32(stride_head_scale));
@@ -1623,7 +1928,7 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const tensor_dims q_pad_dims = { head_dim_padded, qo_len, q_dims.heads, q_dims.batch };
     const tensor_dims k_pad_dims = { head_dim_padded, kv_len, k_dims.heads, k_dims.batch };
-    const tensor_dims v_pad_dims = { head_dim_padded, kv_len_padded, v_dims.heads, v_dims.batch };
+    const tensor_dims v_pad_dims = { head_dim_padded, kv_len, v_dims.heads, v_dims.batch };
 
     const tensor_strides q_strides = get_tensor_strides(q);
     const tensor_strides k_strides = get_tensor_strides(k);
@@ -1632,11 +1937,27 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const tensor_strides q_pad_strides = make_contiguous_strides(q_pad_dims);
     const tensor_strides k_pad_strides = make_contiguous_strides(k_pad_dims);
     const tensor_strides v_pad_strides = make_contiguous_strides(v_pad_dims);
-
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<T> q_padded(pool, q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch);
     ggml_cuda_pool_alloc<T> k_padded(pool, k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch);
     ggml_cuda_pool_alloc<T> v_padded(pool, v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch);
+    const int batch = q_dims.batch;
+    const int num_q_heads = q_dims.heads;
+    const int num_k_heads = k_dims.heads;
+    GGML_ASSERT(num_q_heads % num_k_heads == 0);
+    const int num_kv_groups = num_q_heads / num_k_heads;
+    const tensor_strides q_bhsd_strides = {
+        head_dim_padded,
+        (int64_t) head_dim_padded * qo_len,
+        (int64_t) head_dim_padded * qo_len * num_q_heads,
+    };
+    const tensor_strides k_bhsd_strides = {
+        head_dim_padded,
+        (int64_t) head_dim_padded * kv_len,
+        (int64_t) head_dim_padded * kv_len * num_k_heads,
+    };
+    ggml_cuda_pool_alloc<T> q_contig(pool, (size_t) batch * num_q_heads * qo_len * head_dim_padded);
+    ggml_cuda_pool_alloc<T> k_contig(pool, (size_t) batch * num_k_heads * kv_len * head_dim_padded);
 
     copy_pad_tensor(
         static_cast<const T *>(q->data),
@@ -1644,9 +1965,22 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         q_pad_dims, q_pad_strides,
         q_padded.get(),
         stream);
-    sage_debug_dump(dump_prefix, "q_f16", q_padded.get(),
-        (size_t) q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch * sizeof(T),
+    convert_dshb_to_bhsd_host(
+        q_padded.get(),
+        q_contig.get(),
+        head_dim_padded,
+        qo_len,
+        num_q_heads,
+        batch,
         stream);
+    if (dump_prefix) {
+        sage_debug_dump(dump_prefix, "q_f16", q_padded.get(),
+            (size_t) q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch * sizeof(T),
+            stream);
+        sage_debug_dump(dump_prefix, "q_bhsd", q_contig.get(),
+            (size_t) batch * num_q_heads * qo_len * head_dim_padded * sizeof(T),
+            stream);
+    }
 
     copy_pad_tensor(
         static_cast<const T *>(k->data),
@@ -1654,9 +1988,22 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         k_pad_dims, k_pad_strides,
         k_padded.get(),
         stream);
-    sage_debug_dump(dump_prefix, "k_f16", k_padded.get(),
-        (size_t) k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch * sizeof(T),
+    convert_dshb_to_bhsd_host(
+        k_padded.get(),
+        k_contig.get(),
+        head_dim_padded,
+        kv_len,
+        num_k_heads,
+        batch,
         stream);
+    if (dump_prefix) {
+        sage_debug_dump(dump_prefix, "k_f16", k_padded.get(),
+            (size_t) k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch * sizeof(T),
+            stream);
+        sage_debug_dump(dump_prefix, "k_bhsd", k_contig.get(),
+            (size_t) batch * num_k_heads * kv_len * head_dim_padded * sizeof(T),
+            stream);
+    }
 
     copy_pad_tensor(
         static_cast<const T *>(v->data),
@@ -1664,13 +2011,9 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         v_pad_dims, v_pad_strides,
         v_padded.get(),
         stream);
-
-    const int batch = q_dims.batch;
-    const int num_q_heads = q_dims.heads;
-    const int num_k_heads = k_dims.heads;
-    GGML_ASSERT(num_q_heads % num_k_heads == 0);
-    const int num_kv_groups = num_q_heads / num_k_heads;
-
+    sage_debug_dump(dump_prefix, "v_f16", v_padded.get(),
+        (size_t) v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch * sizeof(T),
+        stream);
     sage_kernel_debug_q q_kernel_debug = {};
     size_t q_kernel_debug_slots = 0;
     std::unique_ptr<ggml_cuda_pool_alloc<uint32_t>> dbg_q_token_storage;
@@ -1758,28 +2101,92 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (void *) q_quant_debug.token_start);
     }
 
-    const T * q_quant_src = q_padded.get();
-    switch (head_dim_padded) {
-        case 64:
-            if (per_thread_qk) {
-                quantize_q_per_thread<T, 64>(q_quant_src, q_int8.get(), q_scale.get(), batch, num_q_heads, qo_len, stream);
-            } else {
+    const T * q_quant_src = q_contig.get();
+    ggml_cuda_sage::quant_debug_config k_quant_debug = {};
+    size_t k_quant_debug_elems = 0;
+    std::unique_ptr<ggml_cuda_pool_alloc<uint32_t>> dbg_k_quant_token_storage;
+    std::unique_ptr<ggml_cuda_pool_alloc<float>> dbg_k_quant_amax_storage;
+    std::unique_ptr<ggml_cuda_pool_alloc<float>> dbg_k_quant_scale_storage;
+    std::unique_ptr<ggml_cuda_pool_alloc<half>> dbg_k_quant_samples_storage;
+    if (sage_force_host_quant()) {
+        quantize_q_per_warp_host(
+            q_quant_src,
+            q_int8.get(),
+            q_scale.get(),
+            batch,
+            num_q_heads,
+            qo_len,
+            head_dim_padded,
+            stream);
+    } else if (per_thread_qk) {
+        switch (head_dim_padded) {
+            case 64:
+                quantize_q_per_thread<T, 64>(
+                    q_quant_src,
+                    q_int8.get(),
+                    q_scale.get(),
+                    batch,
+                    num_q_heads,
+                    qo_len,
+                    stream);
+                break;
+            case 128:
+                quantize_q_per_thread<T, 128>(
+                    q_quant_src,
+                    q_int8.get(),
+                    q_scale.get(),
+                    batch,
+                    num_q_heads,
+                    qo_len,
+                    stream);
+                break;
+            default:
+                GGML_ABORT("unsupported head_dim_padded");
+        }
+    } else {
+        switch (head_dim_padded) {
+            case 64:
                 quantize_q_per_warp<T, 64>(
-                    q_quant_src, q_int8.get(), q_scale.get(), batch, num_q_heads, qo_len, stream,
-                    (debug_quant_dev && !per_thread_qk) ? q_quant_debug : ggml_cuda_sage::quant_debug_config{});
-            }
-            break;
-        case 128:
-            if (per_thread_qk) {
-                quantize_q_per_thread<T, 128>(q_quant_src, q_int8.get(), q_scale.get(), batch, num_q_heads, qo_len, stream);
-            } else {
+                    q_quant_src,
+                    q_int8.get(),
+                    q_scale.get(),
+                    batch,
+                    num_q_heads,
+                    qo_len,
+                    stream,
+                    q_quant_debug);
+                break;
+            case 128:
                 quantize_q_per_warp<T, 128>(
-                    q_quant_src, q_int8.get(), q_scale.get(), batch, num_q_heads, qo_len, stream,
-                    (debug_quant_dev && !per_thread_qk) ? q_quant_debug : ggml_cuda_sage::quant_debug_config{});
-            }
-            break;
-        default:
-            GGML_ABORT("SageAttention SM89: unsupported head_dim");
+                    q_quant_src,
+                    q_int8.get(),
+                    q_scale.get(),
+                    batch,
+                    num_q_heads,
+                    qo_len,
+                    stream,
+                    q_quant_debug);
+                break;
+            default:
+            GGML_ABORT("unsupported head_dim_padded");
+        }
+    }
+    if (debug_quant_dev && !per_thread_qk) {
+        k_quant_debug.stride = k_scale_cols;
+        k_quant_debug_elems = (size_t) batch * num_k_heads * k_scale_cols;
+        if (k_quant_debug_elems > 0) {
+            dbg_k_quant_token_storage = std::make_unique<ggml_cuda_pool_alloc<uint32_t>>(pool, k_quant_debug_elems);
+            dbg_k_quant_amax_storage  = std::make_unique<ggml_cuda_pool_alloc<float>>(pool, k_quant_debug_elems);
+            dbg_k_quant_scale_storage = std::make_unique<ggml_cuda_pool_alloc<float>>(pool, k_quant_debug_elems);
+            k_quant_debug.token_start = dbg_k_quant_token_storage->get();
+            k_quant_debug.amax = dbg_k_quant_amax_storage->get();
+            k_quant_debug.scale = dbg_k_quant_scale_storage->get();
+            const uint32_t sample_tokens = BLKK;
+            const size_t sample_stride = (size_t) sample_tokens * head_dim_padded;
+            dbg_k_quant_samples_storage = std::make_unique<ggml_cuda_pool_alloc<half>>(pool, k_quant_debug_elems * sample_stride);
+            k_quant_debug.samples = dbg_k_quant_samples_storage->get();
+            k_quant_debug.sample_stride = sample_stride;
+        }
     }
     if (debug_quant) {
         ggml_cuda_pool_alloc<float> q_amax_dev(pool, q_scale_elems);
@@ -1790,12 +2197,12 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             case 64:
                 compute_q_block_amax_kernel<T, 64><<<grid_dbg, block_dbg, 0, stream>>>(
                     q_quant_src, q_amax_dev.get(), qo_len,
-                    to_u32(q_pad_strides.stride_batch), to_u32(q_pad_strides.stride_seq), to_u32(q_pad_strides.stride_head), q_scale_cols);
+                    to_u32(q_bhsd_strides.stride_batch), to_u32(q_bhsd_strides.stride_seq), to_u32(q_bhsd_strides.stride_head), q_scale_cols);
                 break;
             case 128:
                 compute_q_block_amax_kernel<T, 128><<<grid_dbg, block_dbg, 0, stream>>>(
                     q_quant_src, q_amax_dev.get(), qo_len,
-                    to_u32(q_pad_strides.stride_batch), to_u32(q_pad_strides.stride_seq), to_u32(q_pad_strides.stride_head), q_scale_cols);
+                    to_u32(q_bhsd_strides.stride_batch), to_u32(q_bhsd_strides.stride_seq), to_u32(q_bhsd_strides.stride_head), q_scale_cols);
                 break;
         }
         CUDA_CHECK(cudaGetLastError());
@@ -1978,7 +2385,7 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    const T * k_quant_src = k_padded.get();
+    const T * k_quant_src = k_contig.get();
     std::unique_ptr<ggml_cuda_pool_alloc<T>> k_mean_storage;
     T * k_mean_ptr = nullptr;
     if (smooth_k) {
@@ -1988,40 +2395,87 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             head_dim_padded,
             head_dim_padded * num_k_heads,
         };
-        compute_k_mean(k_padded.get(), k_pad_dims, k_pad_strides, mean_strides, k_mean_storage->get(), stream);
+        compute_k_mean(k_contig.get(), k_pad_dims, k_bhsd_strides, mean_strides, k_mean_storage->get(), stream);
         k_mean_ptr = k_mean_storage->get();
+        if (dump_prefix) {
+            sage_debug_dump(dump_prefix, "k_mean", k_mean_ptr,
+                (size_t) head_dim_padded * num_k_heads * batch * sizeof(T),
+                stream);
+        }
+    }
+
+    if (sage_force_host_quant()) {
+        quantize_k_per_block_host(
+            k_quant_src,
+            smooth_k ? k_mean_ptr : nullptr,
+            k_int8.get(),
+            k_scale.get(),
+            batch,
+            num_k_heads,
+            kv_len,
+            head_dim_padded,
+            stream);
+    } else if (per_thread_qk) {
         switch (head_dim_padded) {
             case 64:
-                if (per_thread_qk) {
-                    quantize_k_per_thread<T, 64, true>(k_quant_src, k_mean_ptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                if (smooth_k) {
+                    quantize_k_per_thread<T, 64, true>(
+                        k_quant_src, k_mean_ptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream);
                 } else {
-                    quantize_k_per_block<T, 64, true>(k_quant_src, k_mean_ptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                    quantize_k_per_thread<T, 64, false>(
+                        k_quant_src, nullptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream);
                 }
                 break;
             case 128:
-                if (per_thread_qk) {
-                    quantize_k_per_thread<T, 128, true>(k_quant_src, k_mean_ptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                if (smooth_k) {
+                    quantize_k_per_thread<T, 128, true>(
+                        k_quant_src, k_mean_ptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream);
                 } else {
-                    quantize_k_per_block<T, 128, true>(k_quant_src, k_mean_ptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                    quantize_k_per_thread<T, 128, false>(
+                        k_quant_src, nullptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream);
                 }
                 break;
+            default:
+                GGML_ABORT("unsupported head_dim_padded");
         }
     } else {
         switch (head_dim_padded) {
             case 64:
-                if (per_thread_qk) {
-                    quantize_k_per_thread<T, 64, false>(k_quant_src, nullptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                if (smooth_k) {
+                    quantize_k_per_block<T, 64, true>(
+                        k_quant_src, k_mean_ptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream, k_quant_debug);
                 } else {
-                    quantize_k_per_block<T, 64, false>(k_quant_src, nullptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                    quantize_k_per_block<T, 64, false>(
+                        k_quant_src, nullptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream, k_quant_debug);
                 }
                 break;
             case 128:
-                if (per_thread_qk) {
-                    quantize_k_per_thread<T, 128, false>(k_quant_src, nullptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                if (smooth_k) {
+                    quantize_k_per_block<T, 128, true>(
+                        k_quant_src, k_mean_ptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream, k_quant_debug);
                 } else {
-                    quantize_k_per_block<T, 128, false>(k_quant_src, nullptr, k_int8.get(), k_scale.get(), batch, num_k_heads, kv_len, stream);
+                    quantize_k_per_block<T, 128, false>(
+                        k_quant_src, nullptr,
+                        k_int8.get(), k_scale.get(),
+                        batch, num_k_heads, kv_len, stream, k_quant_debug);
                 }
                 break;
+            default:
+                GGML_ABORT("unsupported head_dim_padded");
         }
     }
     const size_t k_scale_elems = (size_t) batch * num_k_heads * k_scale_cols;
@@ -2035,6 +2489,89 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             smooth_k,
             k_mean_ptr,
             stream);
+    }
+    if (debug_quant_dev && !per_thread_qk && k_quant_debug.token_start != nullptr) {
+        std::vector<uint32_t> host_tokens(k_quant_debug_elems);
+        std::vector<float> host_amax_dbg(k_quant_debug_elems);
+        std::vector<float> host_scale_dbg(k_quant_debug_elems);
+        std::vector<ggml_fp16_t> host_k_samples;
+        if (k_quant_debug.samples && k_quant_debug.sample_stride > 0) {
+            host_k_samples.resize(k_quant_debug_elems * k_quant_debug.sample_stride);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(host_tokens.data(), k_quant_debug.token_start, k_quant_debug_elems * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_amax_dbg.data(), k_quant_debug.amax, k_quant_debug_elems * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_scale_dbg.data(), k_quant_debug.scale, k_quant_debug_elems * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        if (k_quant_debug.samples && k_quant_debug.sample_stride > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(host_k_samples.data(), k_quant_debug.samples, host_k_samples.size() * sizeof(ggml_fp16_t), cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        bool mismatch = false;
+        size_t printed = 0;
+        const int blocks_k = div_ceil64(kv_len, BLKK);
+        const char * sample_prefix = getenv("GGML_SAGE_SAMPLE_PREFIX");
+        const int sample_head_filter = getenv("GGML_SAGE_SAMPLE_HEAD") ? atoi(getenv("GGML_SAGE_SAMPLE_HEAD")) : -1;
+        const int sample_blk_filter = getenv("GGML_SAGE_SAMPLE_BLOCK") ? atoi(getenv("GGML_SAGE_SAMPLE_BLOCK")) : -1;
+        const int sample_limit = getenv("GGML_SAGE_SAMPLE_LIMIT") ? atoi(getenv("GGML_SAGE_SAMPLE_LIMIT")) : 4;
+        int sample_dumps = 0;
+        for (int b = 0; b < batch && !mismatch; ++b) {
+            for (int h = 0; h < num_k_heads && !mismatch; ++h) {
+                for (int blk = 0; blk < blocks_k && !mismatch; ++blk) {
+                    const size_t idx =
+                        (size_t) b * num_k_heads * k_scale_cols +
+                        (size_t) h * k_scale_cols +
+                        blk;
+                    if (idx >= k_quant_debug_elems) {
+                        continue;
+                    }
+                    const int token_expected = blk * BLKK;
+                    if (token_expected >= kv_len) {
+                        continue;
+                    }
+                    const uint32_t token_recorded = host_tokens[idx];
+                    if (printed < 4) {
+                        fprintf(stderr,
+                                "SAGE_K_DEV_DEBUG batch=%d head=%d blk=%d token=%u expected=%d scale=%g amax=%g\n",
+                                b, h, blk,
+                                token_recorded,
+                                token_expected,
+                                host_scale_dbg[idx],
+                                host_amax_dbg[idx]);
+                        printed++;
+                    }
+                    if (token_recorded != (uint32_t) token_expected) {
+                        fprintf(stderr,
+                                "SAGE_K_DEV_DEBUG mismatch batch=%d head=%d blk=%d recorded_token=%u expected_token=%d\n",
+                                b, h, blk,
+                                token_recorded,
+                                token_expected);
+                        mismatch = true;
+                        break;
+                    }
+                    if (sample_prefix && !host_k_samples.empty() &&
+                            (sample_head_filter == -1 || sample_head_filter == h) &&
+                            (sample_blk_filter == -1 || sample_blk_filter == blk) &&
+                            sample_dumps < sample_limit) {
+                        const size_t sample_offset = idx * k_quant_debug.sample_stride;
+                        const int token_count = std::min<int>(BLKK, kv_len - token_expected);
+                        const std::string path = std::string(sample_prefix) +
+                            ".k.b" + std::to_string(b) +
+                            "_h" + std::to_string(h) +
+                            "_blk" + std::to_string(blk) + ".bin";
+                        FILE * fp = fopen(path.c_str(), "wb");
+                        if (fp) {
+                            fwrite(host_k_samples.data() + sample_offset, sizeof(ggml_fp16_t),
+                                   (size_t) token_count * head_dim_padded, fp);
+                            fclose(fp);
+                            fprintf(stderr, "SAGE_K_DEV_DEBUG wrote sample %s tokens=%d\n", path.c_str(), token_count);
+                        }
+                        sample_dumps++;
+                    }
+                }
+            }
+        }
+        if (!mismatch) {
+            fprintf(stderr, "SAGE_K_DEV_DEBUG token order verified for %zu entries\n", k_quant_debug_elems);
+        }
     }
     if (dump_prefix) {
         sage_debug_dump(dump_prefix, "k_scale", k_scale.get(), k_scale_elems * sizeof(float), stream);
@@ -2053,12 +2590,12 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             case 64:
                 compute_k_block_amax_kernel<T, 64><<<grid_dbg_k, block_dbg_k, 0, stream>>>(
                     k_quant_src, k_amax_dev.get(), kv_len,
-                    to_u32(k_pad_strides.stride_batch), to_u32(k_pad_strides.stride_seq), to_u32(k_pad_strides.stride_head), k_scale_cols);
+                    to_u32(k_bhsd_strides.stride_batch), to_u32(k_bhsd_strides.stride_seq), to_u32(k_bhsd_strides.stride_head), k_scale_cols);
                 break;
             case 128:
                 compute_k_block_amax_kernel<T, 128><<<grid_dbg_k, block_dbg_k, 0, stream>>>(
                     k_quant_src, k_amax_dev.get(), kv_len,
-                    to_u32(k_pad_strides.stride_batch), to_u32(k_pad_strides.stride_seq), to_u32(k_pad_strides.stride_head), k_scale_cols);
+                    to_u32(k_bhsd_strides.stride_batch), to_u32(k_bhsd_strides.stride_seq), to_u32(k_bhsd_strides.stride_head), k_scale_cols);
                 break;
         }
         CUDA_CHECK(cudaGetLastError());
@@ -2106,10 +2643,10 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             transpose_pad_permute<T, 128>(v_padded.get(), v_transposed.get(), batch, num_k_heads, kv_len, kv_len_padded, stream);
             break;
     }
-    if (dump_prefix) {
-        sage_debug_dump(dump_prefix, "v_transposed", v_transposed.get(),
-            (size_t) batch * num_k_heads * head_dim_padded * kv_len_padded * sizeof(T), stream);
-    }
+if (dump_prefix) {
+    sage_debug_dump(dump_prefix, "v_transposed", v_transposed.get(),
+        (size_t) batch * num_k_heads * head_dim_padded * kv_len_padded * sizeof(T), stream);
+}
 
     bool smooth_v = smooth_v_param;
     if (smooth_v && pv_accum != GGML_SAGE_PV_ACCUM_FP32) {
@@ -2131,16 +2668,20 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (head_dim_padded) {
         case 64:
             if (smooth_v) {
-                quantize_v_to_fp8<T, 64, true>(v_transposed.get(), v_fp8.get(), v_mean_ptr, v_scale.get(), v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, stream);
+                quantize_v_per_channel<T, true>(v_transposed.get(), v_fp8.get(), v_mean_ptr, v_scale.get(),
+                    v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, kv_len_padded, stream);
             } else {
-                quantize_v_to_fp8<T, 64, false>(v_transposed.get(), v_fp8.get(), nullptr, v_scale.get(), v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, stream);
+                quantize_v_per_channel<T, false>(v_transposed.get(), v_fp8.get(), nullptr, v_scale.get(),
+                    v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, kv_len_padded, stream);
             }
             break;
         case 128:
             if (smooth_v) {
-                quantize_v_to_fp8<T, 128, true>(v_transposed.get(), v_fp8.get(), v_mean_ptr, v_scale.get(), v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, stream);
+                quantize_v_per_channel<T, true>(v_transposed.get(), v_fp8.get(), v_mean_ptr, v_scale.get(),
+                    v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, kv_len_padded, stream);
             } else {
-                quantize_v_to_fp8<T, 128, false>(v_transposed.get(), v_fp8.get(), nullptr, v_scale.get(), v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, stream);
+                quantize_v_per_channel<T, false>(v_transposed.get(), v_fp8.get(), nullptr, v_scale.get(),
+                    v_scale_max, batch, num_k_heads, head_dim_padded, kv_len, kv_len_padded, stream);
             }
             break;
     }
@@ -2172,14 +2713,14 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                    q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
+                    q_bhsd_strides, k_bhsd_strides, out_pad_strides, v_quant_strides,
                     sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             } else {
                 launch_sage_kernel<T, 64, MaskMode::kNone>(
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                    q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
+                    q_bhsd_strides, k_bhsd_strides, out_pad_strides, v_quant_strides,
                     sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             }
             break;
@@ -2189,14 +2730,14 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                    q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
+                    q_bhsd_strides, k_bhsd_strides, out_pad_strides, v_quant_strides,
                     sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             } else {
                 launch_sage_kernel<T, 128, MaskMode::kNone>(
                     q_int8.get(), k_int8.get(), v_fp8.get(), out_padded.get(),
                     q_scale.get(), k_scale.get(), v_scale.get(), v_mean_ptr,
                     batch, num_q_heads, num_k_heads, qo_len, kv_len, num_kv_groups,
-                    q_pad_strides, k_pad_strides, out_pad_strides, v_quant_strides,
+                    q_bhsd_strides, k_bhsd_strides, out_pad_strides, v_quant_strides,
                     sm_scale, stream, granularity, pv_accum, q_kernel_debug);
             }
             break;

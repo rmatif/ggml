@@ -66,8 +66,10 @@ struct external_data {
     std::vector<ggml_fp16_t> q;
     std::vector<ggml_fp16_t> k;
     std::vector<ggml_fp16_t> v;
+    std::vector<float> ref_sage_quant;
     std::vector<float> ref_sage;
     std::vector<float> ref_flash;
+    bool has_ref_sage_quant = false;
     bool has_ref_sage = false;
     bool has_ref_flash = false;
     std::string prefix;
@@ -184,6 +186,27 @@ static bool load_binary(const std::string & path, std::vector<T> & data, size_t 
     return true;
 }
 
+static void convert_dsbh_to_bhsd(std::vector<float> & data, int head_dim, int seq, int heads, int batch) {
+    if (data.empty()) {
+        return;
+    }
+    std::vector<float> reordered(data.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int s = 0; s < seq; ++s) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const size_t dst =
+                        (((size_t) b * heads + h) * seq + s) * head_dim + d;
+                    const size_t src =
+                        ((((size_t) d * seq) + s) * heads + h) * batch + b;
+                    reordered[dst] = data[src];
+                }
+            }
+        }
+    }
+    data.swap(reordered);
+}
+
 static bool load_external_case(const std::string & prefix, external_data & ext) {
     ext.prefix = prefix;
     sage_case cfg = {};
@@ -202,8 +225,17 @@ static bool load_external_case(const std::string & prefix, external_data & ext) 
     if (!load_binary(prefix + ".q.bin", ext.q, q_elems)) return false;
     if (!load_binary(prefix + ".k.bin", ext.k, k_elems)) return false;
     if (!load_binary(prefix + ".v.bin", ext.v, v_elems)) return false;
+    ext.has_ref_sage_quant = load_binary(prefix + ".sage_quant.bin", ext.ref_sage_quant, out_elems);
     ext.has_ref_sage = load_binary(prefix + ".sage.bin", ext.ref_sage, out_elems);
     ext.has_ref_flash = load_binary(prefix + ".flash.bin", ext.ref_flash, out_elems);
+    if (ext.has_ref_sage_quant) {
+        // already stored in BHSd order
+    } else if (ext.has_ref_sage) {
+        convert_dsbh_to_bhsd(ext.ref_sage, cfg.head_dim, cfg.seq_q, cfg.num_q_heads, cfg.batch);
+    }
+    if (ext.has_ref_flash) {
+        convert_dsbh_to_bhsd(ext.ref_flash, cfg.head_dim, cfg.seq_q, cfg.num_q_heads, cfg.batch);
+    }
 
     ext.cfg = cfg;
     ext.active = true;
@@ -311,8 +343,13 @@ static case_result run_case(const sage_case & cfg, ggml_backend_t backend, uint6
         ref_output = &flash_out;
         ref_has_non_finite = has_non_finite(*ref_output);
     } else {
-        GGML_ASSERT(ext && ext->has_ref_sage);
-        ref_output = &ext->ref_sage;
+        GGML_ASSERT(ext);
+        if (ext->has_ref_sage_quant) {
+            ref_output = &ext->ref_sage_quant;
+        } else {
+            GGML_ASSERT(ext->has_ref_sage);
+            ref_output = &ext->ref_sage;
+        }
         ref_has_non_finite = has_non_finite(*ref_output);
     }
 
