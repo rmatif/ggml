@@ -16,7 +16,7 @@ globally through environment variables. The CPU op stores the following fields i
 | `smooth_k` | `--smooth-k/--no-smooth-k`, `GGML_SAGE_SMOOTH_K=0|1` | Enable K smoothing (recommended for per-warp granularity). |
 | `smooth_v` | `--smooth-v/--no-smooth-v`, `GGML_SAGE_SMOOTH_V=0|1` | Enable V smoothing. Requires `pv_accum=fp32`; incompatible modes are automatically disabled with a runtime warning. |
 | `pv_accum` (`fp32`, `fp32+fp32`, `fp32+fp16`) | `--pv-accum ...`, `GGML_SAGE_PV_ACCUM=...` | Matches SageAttention’s PV accumulation dtype selection. Controls whether the kernel materializes the PV intermediate buffer and whether FP8 scales are capped at 2.25 or 448. |
-| `quant_granularity` | `--granularity per_warp|per_thread` | Select Q/K quantization granularity. Mixed-head configurations are supported. |
+| `quant_granularity` | `--granularity per_warp|per_thread` | Select Q/K quantization granularity. Unsupported modes (e.g. `per_thread` on CUDA SM89) are downgraded to `per_warp` with a warning so downstream apps retain compatibility. |
 
 Tips:
 
@@ -39,8 +39,7 @@ This port mirrors SageAttention’s SM89 FP8 path:
 - Debug hooks and dumps to inspect head-dim padding, quantized payloads, and V
   transpose/FP8 conversion.
 
-Not yet implemented (and therefore intentionally unsupported):
-
+- Head dimensions beyond 64 or 128. Inputs are padded up to 64 or 128 to match SageAttention’s kernels; higher widths are rejected during graph construction.
 - Returning log-sum-exp buffers (`return_lse=True`).
 - Alternative tensor layouts (e.g. `tensor_layout="NHD"`).
 - FP16 PV kernels (`sageattn_qk_int8_pv_fp16_cuda`) or SM80/SM90 backends.
