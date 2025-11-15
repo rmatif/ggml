@@ -40,7 +40,7 @@ def load_v_fp8(path: Path, batch: int, heads: int, head_dim: int, seq: int):
     expected = batch * heads * head_dim * seq
     if data.size != expected:
         raise ValueError(f"unexpected size for {path} (got {data.size}, expected {expected})")
-    tensor = torch.from_numpy(data).cuda().reshape(batch, heads, head_dim, seq).contiguous()
+    tensor = torch.from_numpy(data.reshape(batch, heads, head_dim, seq)).cuda().contiguous()
     return tensor
 
 
@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--sm-scale", type=float, default=None)
     parser.add_argument("--pv-accum", choices=["fp32", "fp32+fp32", "fp32+fp16"], default="fp32+fp16")
     parser.add_argument("--smooth-v", action="store_true")
+    parser.add_argument("--compare-dump", type=Path, help="Optional GGML_SAGE_DUMP_OUT prefix (to compare against ggml output)")
     args = parser.parse_args()
 
     head_dim = args.head_dim
@@ -111,12 +112,27 @@ def main():
                tensor_layout_flag, 1 if args.causal else 0, q_gran, sm_scale, 0)
 
     out = out.cpu().numpy()[..., :head_dim]
-    ref = np.fromfile(args.case_prefix.with_suffix(".sage.bin"), dtype=np.float32).reshape(head_dim, args.seq_q, args.num_q_heads, args.batch)
-    out = np.transpose(out, (3, 2, 1, 0)).reshape(ref.shape)
+    ref = np.fromfile(args.case_prefix.with_suffix(".sage_quant.bin"), dtype=np.float32)
+    ref = ref.reshape(args.batch, args.num_q_heads, args.seq_q, head_dim)
+    out = np.transpose(out, (0, 1, 2, 3))
+    out = out[..., :head_dim]
+    ref = ref.astype(np.float32)
+    out = out.astype(np.float32)
 
     diff = out - ref
     print("official kernel vs reference rms:", np.sqrt(np.mean(diff**2)))
     print("max diff:", np.max(np.abs(diff)))
+
+    if args.compare_dump is not None:
+        dump = np.fromfile(args.compare_dump.with_suffix(".out.bin"), dtype=np.float16)
+        dump = dump.reshape(args.head_dim, args.seq_q, args.num_q_heads, args.batch)
+        dump = np.transpose(dump, (3, 2, 1, 0)).astype(np.float32)
+        dump_vs_ref = dump - ref
+        dump_vs_official = dump - out
+        print("reference vs ggml dump rms:", np.sqrt(np.mean(dump_vs_ref**2)))
+        print("official vs ggml dump rms:", np.sqrt(np.mean(dump_vs_official**2)))
+        idx = np.unravel_index(np.argmax(np.abs(dump_vs_official)), dump_vs_official.shape)
+        print("worst diff at (batch,head,seq,dim)=", idx, " value=", dump_vs_official[idx])
 
 
 if __name__ == "__main__":

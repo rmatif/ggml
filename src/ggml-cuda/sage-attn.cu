@@ -607,8 +607,11 @@ __global__ void convert_dshb_to_bhsd_kernel(
         tmp /= seq_len;
         const int h = tmp % heads;
         const int b = tmp / heads;
-        const size_t dst_index = (((size_t) b * heads + h) * seq_len + s) * head_dim + d;
-        dst[dst_index] = src[idx];
+        const size_t dst_index =
+            (((size_t) b * heads + h) * seq_len + s) * head_dim + d;
+        const size_t src_index =
+            (((size_t) d * seq_len + s) * heads + h) * batch + b;
+        dst[dst_index] = src[src_index];
     }
 }
 
@@ -2289,6 +2292,9 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     std::unique_ptr<ggml_cuda_pool_alloc<T>> q_padded;
     std::unique_ptr<ggml_cuda_pool_alloc<T>> k_padded;
     std::unique_ptr<ggml_cuda_pool_alloc<T>> v_padded;
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> q_bhsd;
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> k_bhsd;
+    std::unique_ptr<ggml_cuda_pool_alloc<T>> v_bhsd;
     const int batch = q_dims.batch;
     const int num_q_heads = q_dims.heads;
     const int num_k_heads = k_dims.heads;
@@ -2307,13 +2313,20 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         (int64_t) head_dim_padded * kv_len,
         (int64_t) head_dim_padded * kv_len * num_k_heads,
     };
-    const tensor_strides v_bhsd_strides = {
+    const tensor_strides v_transposed_strides = {
         head_dim_padded,
         (int64_t) head_dim_padded * kv_len_padded,
         (int64_t) head_dim_padded * kv_len_padded * num_k_heads,
     };
+    const tensor_strides v_bhsd_input_strides = {
+        head_dim_padded,
+        (int64_t) head_dim_padded * kv_len,
+        (int64_t) head_dim_padded * kv_len * num_k_heads,
+    };
     const tensor_strides q_input_strides = need_q_pad ? q_pad_strides : q_strides;
     const tensor_strides k_input_strides = need_k_pad ? k_pad_strides : k_strides;
+    const tensor_dims & q_src_dims = need_q_pad ? q_pad_dims : q_dims;
+    const tensor_dims & k_src_dims = need_k_pad ? k_pad_dims : k_dims;
     const T * q_input_ptr = static_cast<const T *>(q->data);
     T * q_padded_ptr = nullptr;
     if (need_q_pad) {
@@ -2359,7 +2372,54 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             stream);
     }
 
-    const bool need_v_pad = dump_prefix != nullptr || force_host_permute;
+    q_bhsd = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch);
+    CUDA_CHECK(cudaMemsetAsync(q_bhsd->get(), 0, (size_t) q_pad_dims.head_dim * q_pad_dims.seq_len * q_pad_dims.heads * q_pad_dims.batch * sizeof(T), stream));
+    if (force_host_permute) {
+        convert_dshb_to_bhsd_host(
+            q_input_ptr,
+            q_bhsd->get(),
+            q_src_dims.head_dim,
+            q_src_dims.seq_len,
+            q_src_dims.heads,
+            q_src_dims.batch,
+            stream);
+    } else {
+        convert_dshb_to_bhsd_device(
+            q_input_ptr,
+            q_bhsd->get(),
+            q_src_dims.head_dim,
+            q_src_dims.seq_len,
+            q_src_dims.heads,
+            q_src_dims.batch,
+            stream);
+    }
+    q_input_ptr = q_bhsd->get();
+
+    k_bhsd = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch);
+    CUDA_CHECK(cudaMemsetAsync(k_bhsd->get(), 0, (size_t) k_pad_dims.head_dim * k_pad_dims.seq_len * k_pad_dims.heads * k_pad_dims.batch * sizeof(T), stream));
+    if (force_host_permute) {
+        convert_dshb_to_bhsd_host(
+            k_input_ptr,
+            k_bhsd->get(),
+            k_src_dims.head_dim,
+            k_src_dims.seq_len,
+            k_src_dims.heads,
+            k_src_dims.batch,
+            stream);
+    } else {
+        convert_dshb_to_bhsd_device(
+            k_input_ptr,
+            k_bhsd->get(),
+            k_src_dims.head_dim,
+            k_src_dims.seq_len,
+            k_src_dims.heads,
+            k_src_dims.batch,
+            stream);
+    }
+    k_input_ptr = k_bhsd->get();
+
+    const bool need_v_pad = require_dim_pad || dump_prefix != nullptr || force_host_permute;
+    const tensor_dims & v_src_dims = need_v_pad ? v_pad_dims : v_dims;
     T * v_padded_ptr = nullptr;
     if (need_v_pad) {
         v_padded = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch);
@@ -2376,6 +2436,29 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (size_t) v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch * sizeof(T),
             stream);
     }
+
+    v_bhsd = std::make_unique<ggml_cuda_pool_alloc<T>>(pool, v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch);
+    CUDA_CHECK(cudaMemsetAsync(v_bhsd->get(), 0, (size_t) v_pad_dims.head_dim * v_pad_dims.seq_len * v_pad_dims.heads * v_pad_dims.batch * sizeof(T), stream));
+    if (force_host_permute) {
+        convert_dshb_to_bhsd_host(
+            v_padded_ptr ? v_padded_ptr : static_cast<const T *>(v->data),
+            v_bhsd->get(),
+            v_src_dims.head_dim,
+            v_src_dims.seq_len,
+            v_src_dims.heads,
+            v_src_dims.batch,
+            stream);
+    } else {
+        convert_dshb_to_bhsd_device(
+            v_padded_ptr ? v_padded_ptr : static_cast<const T *>(v->data),
+            v_bhsd->get(),
+            v_src_dims.head_dim,
+            v_src_dims.seq_len,
+            v_src_dims.heads,
+            v_src_dims.batch,
+            stream);
+    }
+    const T * v_bhsd_ptr = v_bhsd->get();
     sage_kernel_debug_q q_kernel_debug = {};
     size_t q_kernel_debug_slots = 0;
     std::unique_ptr<ggml_cuda_pool_alloc<uint32_t>> dbg_q_token_storage;
@@ -3082,8 +3165,8 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (head_dim_padded) {
         case 64:
             if (enable_v_fused) {
-                const T * fusion_src = need_v_transposed ? v_transposed_ptr : static_cast<const T *>(v->data);
-                const tensor_strides & fusion_strides = need_v_transposed ? v_bhsd_strides : v_strides;
+                const T * fusion_src = need_v_transposed ? v_transposed_ptr : v_bhsd_ptr;
+                const tensor_strides & fusion_strides = need_v_transposed ? v_transposed_strides : v_bhsd_input_strides;
                 if (smooth_v) {
                     quantize_v_per_channel_fused<T, 64, true>(
                         fusion_src,
@@ -3138,8 +3221,8 @@ void sage_attn_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             break;
         case 128:
             if (enable_v_fused) {
-                const T * fusion_src = need_v_transposed ? v_transposed_ptr : static_cast<const T *>(v->data);
-                const tensor_strides & fusion_strides = need_v_transposed ? v_bhsd_strides : v_strides;
+                const T * fusion_src = need_v_transposed ? v_transposed_ptr : v_bhsd_ptr;
+                const tensor_strides & fusion_strides = need_v_transposed ? v_transposed_strides : v_bhsd_input_strides;
                 if (smooth_v) {
                     quantize_v_per_channel_fused<T, 128, true>(
                         fusion_src,

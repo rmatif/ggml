@@ -63,7 +63,7 @@ def load_tensor(prefix: Path, suffix: str, dtype, shape) -> np.ndarray:
     data = np.fromfile(prefix.with_suffix(f".{suffix}.bin"), dtype=dtype)
     if data.size != np.prod(shape):
         raise ValueError(f"Unexpected size for {suffix}: got {data.size}, expected {np.prod(shape)}")
-    return data.reshape(shape, order="F").copy()
+    return data.reshape(shape).copy()
 
 
 def verify_transpose(case_prefix: Path, dump_prefix: Path, meta: dict) -> float:
