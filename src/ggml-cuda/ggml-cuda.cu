@@ -2301,14 +2301,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
-static cudnnDataType_t ggml_type_to_cudnn_data_type(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:  return CUDNN_DATA_FLOAT;
-        case GGML_TYPE_F16:  return CUDNN_DATA_HALF;
-        default: GGML_ABORT("unsupported data type for cuDNN conv2d");
-    }
-}
-
 static cudnnHandle_t get_cudnn_handle(ggml_backend_cuda_context & ctx, int device) {
     if (ctx.cudnn_handles[device] == nullptr) {
         ggml_cuda_set_device(device);
@@ -2525,6 +2517,334 @@ static void ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tens
     }
 }
 
+
+static __global__ void reorder_whdcn_to_ncdhw_kernel(
+        const float * src, half * dst,
+        int64_t N, int64_t C, int64_t D, int64_t H, int64_t W) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = N * C * D * H * W;
+    if (idx >= total) {
+        return;
+    }
+
+    int64_t tmp = idx;
+    const int64_t w = tmp % W; tmp /= W;
+    const int64_t h = tmp % H; tmp /= H;
+    const int64_t d = tmp % D; tmp /= D;
+    const int64_t c = tmp % C;
+    const int64_t n = tmp / C;
+
+    const int64_t src_idx = w + W * (h + H * (d + D * (c + C * n)));
+    dst[idx] = __float2half(src[src_idx]);
+}
+
+static __global__ void reorder_ncdhw_to_whdcn_kernel(
+        const half * src, float * dst,
+        int64_t N, int64_t C, int64_t D, int64_t H, int64_t W) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = N * C * D * H * W;
+    if (idx >= total) {
+        return;
+    }
+
+    int64_t tmp = idx;
+    const int64_t w = tmp % W; tmp /= W;
+    const int64_t h = tmp % H; tmp /= H;
+    const int64_t d = tmp % D; tmp /= D;
+    const int64_t c = tmp % C;
+    const int64_t n = tmp / C;
+
+    const int64_t dst_idx = w + W * (h + H * (d + D * (c + C * n)));
+    dst[dst_idx] = __half2float(src[idx]);
+}
+
+static __global__ void reorder_kernel_kwkhkd_icoc_to_occkdkhkw_kernel(
+        const float * src, half * dst,
+        int64_t OC, int64_t C, int64_t KD, int64_t KH, int64_t KW) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = OC * C * KD * KH * KW;
+    if (idx >= total) {
+        return;
+    }
+
+    int64_t tmp = idx;
+    const int64_t kw = tmp % KW; tmp /= KW;
+    const int64_t kh = tmp % KH; tmp /= KH;
+    const int64_t kd = tmp % KD; tmp /= KD;
+    const int64_t c  = tmp % C;
+    const int64_t oc = tmp / C;
+
+    const int64_t icoc = c + C * oc;
+    const int64_t src_idx = kw + KW * (kh + KH * (kd + KD * icoc));
+    dst[idx] = __float2half(src[src_idx]);
+}
+
+static __global__ void reorder_kernel_kwkhkd_icoc_to_occkdkhkw_kernel(
+        const half * src, half * dst,
+        int64_t OC, int64_t C, int64_t KD, int64_t KH, int64_t KW) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = OC * C * KD * KH * KW;
+    if (idx >= total) {
+        return;
+    }
+
+    int64_t tmp = idx;
+    const int64_t kw = tmp % KW; tmp /= KW;
+    const int64_t kh = tmp % KH; tmp /= KH;
+    const int64_t kd = tmp % KD; tmp /= KD;
+    const int64_t c  = tmp % C;
+    const int64_t oc = tmp / C;
+
+    const int64_t icoc = c + C * oc;
+    const int64_t src_idx = kw + KW * (kh + KH * (kd + KD * icoc));
+    dst[idx] = src[src_idx];
+}
+
+
+static void ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * src    = dst->src[1];
+
+    const int S0 = ggml_get_op_params_i32(dst, 0);
+    const int S1 = ggml_get_op_params_i32(dst, 1);
+    const int S2 = ggml_get_op_params_i32(dst, 2);
+    const int P0 = ggml_get_op_params_i32(dst, 3);
+    const int P1 = ggml_get_op_params_i32(dst, 4);
+    const int P2 = ggml_get_op_params_i32(dst, 5);
+    const int D0 = ggml_get_op_params_i32(dst, 6);
+    const int D1 = ggml_get_op_params_i32(dst, 7);
+    const int D2 = ggml_get_op_params_i32(dst, 8);
+    const int C  = ggml_get_op_params_i32(dst, 9);
+    const int N  = ggml_get_op_params_i32(dst, 10);
+    const int OC = ggml_get_op_params_i32(dst, 11);
+
+    GGML_ASSERT(kernel->ne[3] == (int64_t) C * OC);
+    GGML_ASSERT(src->ne[3] == (int64_t) C * N);
+    GGML_ASSERT(dst->ne[3] == (int64_t) OC * N);
+
+    const int id = ggml_cuda_get_device();
+    cudnnHandle_t cudnn_handle = get_cudnn_handle(ctx, id);
+    cudaStream_t stream = ctx.stream();
+    CUDNN_CHECK(cudnnSetStream(cudnn_handle, stream));
+
+    if (getenv("GGML_CUDA_CUDNN_LOG")) {
+        fe::isLoggingEnabled() = true;
+    }
+
+    constexpr int64_t X_UID = 201;
+    constexpr int64_t W_UID = 202;
+    constexpr int64_t Y_UID = 203;
+
+    const fe::DataType_t data_type = fe::DataType_t::HALF;
+
+    const std::array<int64_t, 5> x_dims = {
+        (int64_t) N,
+        (int64_t) C,
+        (int64_t) src->ne[2],
+        (int64_t) src->ne[1],
+        (int64_t) src->ne[0],
+    };
+    const std::array<int64_t, 5> w_dims = {
+        (int64_t) OC,
+        (int64_t) C,
+        (int64_t) kernel->ne[2],
+        (int64_t) kernel->ne[1],
+        (int64_t) kernel->ne[0],
+    };
+    const std::array<int64_t, 5> y_dims = {
+        (int64_t) N,
+        (int64_t) OC,
+        (int64_t) dst->ne[2],
+        (int64_t) dst->ne[1],
+        (int64_t) dst->ne[0],
+    };
+
+    auto default_ncdhw_strides = [](const std::array<int64_t, 5> & dims) {
+        std::array<int64_t, 5> strides;
+        strides[4] = 1;
+        strides[3] = dims[4] * strides[4];
+        strides[2] = dims[3] * strides[3];
+        strides[1] = dims[2] * strides[2];
+        strides[0] = dims[1] * strides[1];
+        return strides;
+    };
+
+    const std::array<int64_t, 5> x_strides = default_ncdhw_strides(x_dims);
+    const std::array<int64_t, 5> y_strides = default_ncdhw_strides(y_dims);
+    const std::array<int64_t, 5> w_strides = default_ncdhw_strides(w_dims);
+
+    struct ggml_cudnn_conv3d_key {
+        std::array<int64_t, 5> x_dims;
+        std::array<int64_t, 5> x_strides;
+        std::array<int64_t, 5> w_dims;
+        std::array<int64_t, 5> w_strides;
+        std::array<int64_t, 5> y_dims;
+        std::array<int64_t, 5> y_strides;
+        std::array<int64_t, 3> padding;
+        std::array<int64_t, 3> stride;
+        std::array<int64_t, 3> dilation;
+        int32_t x_type;
+        int32_t w_type;
+        int32_t y_type;
+        int32_t compute_type;
+
+        bool operator<(const ggml_cudnn_conv3d_key & other) const {
+            return std::tie(x_dims, x_strides, w_dims, w_strides,
+                            y_dims, y_strides, padding, stride, dilation,
+                            x_type, w_type, y_type, compute_type) <
+                   std::tie(other.x_dims, other.x_strides, other.w_dims, other.w_strides,
+                            other.y_dims, other.y_strides, other.padding, other.stride, other.dilation,
+                            other.x_type, other.w_type, other.y_type, other.compute_type);
+        }
+    };
+
+    static std::map<ggml_cudnn_conv3d_key, ggml_cudnn_graph_cache_value> s_cudnn_conv3d_graph_cache;
+    static std::mutex s_cudnn_conv3d_graph_cache_mutex;
+
+    ggml_cudnn_conv3d_key key = {
+        x_dims, x_strides,
+        w_dims, w_strides,
+        y_dims, y_strides,
+        { (int64_t) P2, (int64_t) P1, (int64_t) P0 },
+        { (int64_t) S2, (int64_t) S1, (int64_t) S0 },
+        { (int64_t) D2, (int64_t) D1, (int64_t) D0 },
+        static_cast<int32_t>(data_type),
+        static_cast<int32_t>(data_type),
+        static_cast<int32_t>(data_type),
+        static_cast<int32_t>(data_type)
+    };
+
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t workspace_size = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(s_cudnn_conv3d_graph_cache_mutex);
+        auto it = s_cudnn_conv3d_graph_cache.find(key);
+        if (it != s_cudnn_conv3d_graph_cache.end()) {
+            graph = it->second.graph;
+            workspace_size = it->second.workspace_size;
+        } else {
+            auto new_graph = std::make_shared<fe::graph::Graph>();
+            new_graph->set_io_data_type(data_type)
+                     .set_intermediate_data_type(data_type)
+                     .set_compute_data_type(data_type);
+
+            auto X = new_graph->tensor(fe::graph::Tensor_attributes()
+                            .set_uid(X_UID)
+                            .set_dim({ x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4] })
+                            .set_stride({ x_strides[0], x_strides[1], x_strides[2], x_strides[3], x_strides[4] })
+                            .set_data_type(data_type));
+
+            auto W = new_graph->tensor(fe::graph::Tensor_attributes()
+                            .set_uid(W_UID)
+                            .set_dim({ w_dims[0], w_dims[1], w_dims[2], w_dims[3], w_dims[4] })
+                            .set_stride({ w_strides[0], w_strides[1], w_strides[2], w_strides[3], w_strides[4] })
+                            .set_data_type(data_type));
+
+            auto conv_options = fe::graph::Conv_fprop_attributes()
+                                     .set_padding({ key.padding[0], key.padding[1], key.padding[2] })
+                                     .set_stride({ key.stride[0], key.stride[1], key.stride[2] })
+                                     .set_dilation({ key.dilation[0], key.dilation[1], key.dilation[2] });
+
+            auto Y = new_graph->conv_fprop(X, W, conv_options);
+            Y->set_uid(Y_UID)
+             .set_output(true)
+             .set_dim({ y_dims[0], y_dims[1], y_dims[2], y_dims[3], y_dims[4] })
+             .set_stride({ y_strides[0], y_strides[1], y_strides[2], y_strides[3], y_strides[4] })
+             .set_data_type(data_type);
+
+            auto build_status = new_graph->build(cudnn_handle, { fe::HeurMode_t::A,
+                                                                 fe::HeurMode_t::B,
+                                                                 fe::HeurMode_t::FALLBACK });
+            if (!build_status.is_good()) {
+                GGML_LOG_ERROR("%s: cuDNN graph build failed: %s\n", __func__, build_status.get_message().c_str());
+                GGML_LOG_ERROR("%s: x_dims=%lldx%lldx%lldx%lldx%lld, w_dims=%lldx%lldx%lldx%lldx%lld, y_dims=%lldx%lldx%lldx%lldx%lld\n",
+                        __func__,
+                        (long long) x_dims[0], (long long) x_dims[1], (long long) x_dims[2], (long long) x_dims[3], (long long) x_dims[4],
+                        (long long) w_dims[0], (long long) w_dims[1], (long long) w_dims[2], (long long) w_dims[3], (long long) w_dims[4],
+                        (long long) y_dims[0], (long long) y_dims[1], (long long) y_dims[2], (long long) y_dims[3], (long long) y_dims[4]);
+                GGML_LOG_ERROR("%s: stride=%lld,%lld,%lld padding=%lld,%lld,%lld dilation=%lld,%lld,%lld\n",
+                        __func__,
+                        (long long) key.stride[0], (long long) key.stride[1], (long long) key.stride[2],
+                        (long long) key.padding[0], (long long) key.padding[1], (long long) key.padding[2],
+                        (long long) key.dilation[0], (long long) key.dilation[1], (long long) key.dilation[2]);
+                s_cudnn_conv3d_graph_cache[key] = { nullptr, 0 };
+            } else {
+                auto workspace_status = new_graph->get_workspace_size(workspace_size);
+                if (!workspace_status.is_good()) {
+                    GGML_LOG_ERROR("%s: cuDNN get_workspace_size failed: %s\n", __func__, workspace_status.get_message().c_str());
+                    GGML_ABORT("cuDNN workspace query failed for conv3d");
+                }
+
+                s_cudnn_conv3d_graph_cache[key] = { new_graph, workspace_size };
+                graph = std::move(new_graph);
+            }
+        }
+    }
+
+    if (graph == nullptr) {
+        GGML_ABORT("cuDNN graph build failed for conv3d");
+    }
+
+    const int64_t D = src->ne[2];
+    const int64_t H = src->ne[1];
+    const int64_t W_dim = src->ne[0];
+    const int64_t x_elems = (int64_t) N * C * D * H * W_dim;
+    const int threads = 256;
+
+    ggml_cuda_pool_alloc<half> x_cudnn(ctx.pool(id), x_elems);
+    {
+        const int64_t blocks = (x_elems + threads - 1) / threads;
+        GGML_ASSERT(blocks <= INT_MAX);
+        reorder_whdcn_to_ncdhw_kernel<<<blocks, threads, 0, stream>>>(
+                (const float *) src->data, x_cudnn.get(), N, C, D, H, W_dim);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t w_elems = (int64_t) OC * C * kernel->ne[2] * kernel->ne[1] * kernel->ne[0];
+    ggml_cuda_pool_alloc<half> w_cudnn(ctx.pool(id), w_elems);
+    {
+        const int64_t blocks = (w_elems + threads - 1) / threads;
+        GGML_ASSERT(blocks <= INT_MAX);
+        if (kernel->type == GGML_TYPE_F32) {
+            reorder_kernel_kwkhkd_icoc_to_occkdkhkw_kernel<<<blocks, threads, 0, stream>>>(
+                    (const float *) kernel->data, w_cudnn.get(), OC, C, kernel->ne[2], kernel->ne[1], kernel->ne[0]);
+        } else {
+            GGML_ASSERT(kernel->type == GGML_TYPE_F16);
+            reorder_kernel_kwkhkd_icoc_to_occkdkhkw_kernel<<<blocks, threads, 0, stream>>>(
+                    (const half *) kernel->data, w_cudnn.get(), OC, C, kernel->ne[2], kernel->ne[1], kernel->ne[0]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t y_elems = (int64_t) N * OC * dst->ne[2] * dst->ne[1] * dst->ne[0];
+    ggml_cuda_pool_alloc<half> y_cudnn(ctx.pool(id), y_elems);
+
+    ggml_cuda_pool_alloc<int8_t> workspace(ctx.pool(id));
+    if (workspace_size > 0) {
+        workspace.alloc(workspace_size);
+    }
+
+    std::unordered_map<int64_t, void *> variant_pack = {
+        { X_UID, x_cudnn.get() },
+        { W_UID, w_cudnn.get() },
+        { Y_UID, y_cudnn.get() },
+    };
+
+    auto execute_status = graph->execute(cudnn_handle, variant_pack, workspace.get());
+    if (!execute_status.is_good()) {
+        GGML_LOG_ERROR("%s: cuDNN graph execute failed: %s\n", __func__, execute_status.get_message().c_str());
+        GGML_ABORT("cuDNN graph execute failed for conv3d");
+    }
+
+    {
+        const int64_t blocks = (y_elems + threads - 1) / threads;
+        GGML_ASSERT(blocks <= INT_MAX);
+        reorder_ncdhw_to_whdcn_kernel<<<blocks, threads, 0, stream>>>(
+                y_cudnn.get(), (float *) dst->data, N, OC, dst->ne[2], dst->ne[1], dst->ne[0]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -3215,6 +3535,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 } else {
                     ggml_cuda_op_conv2d(ctx, dst);
                 }
+            }
+            break;
+        case GGML_OP_CONV_3D:
+            {
+                static const bool use_cudnn = (getenv("GGML_USE_CONV2D_CUDNN") != nullptr);
+                GGML_ASSERT(use_cudnn && "GGML_OP_CONV_3D requires GGML_USE_CONV2D_CUDNN=1");
+                ggml_cuda_op_conv3d_cudnn(ctx, dst);
             }
             break;
         case GGML_OP_CONV_2D_DW:
@@ -4730,6 +5057,54 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 if (H + 2LL * P1 < (long long) D1 * (KH - 1) + 1) {
+                    return false;
+                }
+
+                return true;
+            }
+        case GGML_OP_CONV_3D:
+            {
+                static const bool use_cudnn = (getenv("GGML_USE_CONV2D_CUDNN") != nullptr);
+                if (!use_cudnn) {
+                    return false;
+                }
+
+                const ggml_tensor * kernel = op->src[0];
+                const ggml_tensor * src = op->src[1];
+
+                if (src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+
+                if (kernel->type != GGML_TYPE_F32 && kernel->type != GGML_TYPE_F16) {
+                    return false;
+                }
+
+                if (!ggml_is_contiguous(src) || !ggml_is_contiguous(kernel)) {
+                    return false;
+                }
+
+                const int P0 = ggml_get_op_params_i32(op, 3);
+                const int P1 = ggml_get_op_params_i32(op, 4);
+                const int P2 = ggml_get_op_params_i32(op, 5);
+                const int D0 = ggml_get_op_params_i32(op, 6);
+                const int D1 = ggml_get_op_params_i32(op, 7);
+                const int D2 = ggml_get_op_params_i32(op, 8);
+
+                const int64_t W  = src->ne[0];
+                const int64_t H  = src->ne[1];
+                const int64_t DE = src->ne[2];
+                const int64_t KW = kernel->ne[0];
+                const int64_t KH = kernel->ne[1];
+                const int64_t KD = kernel->ne[2];
+
+                if (W  + 2LL * P0 < (long long) D0 * (KW - 1) + 1) {
+                    return false;
+                }
+                if (H  + 2LL * P1 < (long long) D1 * (KH - 1) + 1) {
+                    return false;
+                }
+                if (DE + 2LL * P2 < (long long) D2 * (KD - 1) + 1) {
                     return false;
                 }
 
