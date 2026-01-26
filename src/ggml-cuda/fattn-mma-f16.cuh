@@ -508,6 +508,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         KQ_max_new[col] = KQ_max[col];
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+    constexpr int log2_nbatch_fa =
+        nbatch_fa == 256 ? 8 :
+        nbatch_fa == 128 ? 7 :
+        nbatch_fa ==  64 ? 6 :
+        nbatch_fa ==  32 ? 5 :
+        nbatch_fa ==  16 ? 4 :
+        nbatch_fa ==   8 ? 3 : 0;
+    static_assert(log2_nbatch_fa != 0, "unexpected nbatch_fa");
+
+    constexpr float kq_max_offset = FATTN_KQ_MAX_OFFSET + (np == 1 ? (log2_nbatch_fa - 3) * 0.69314718f : 0.0f);
 
     if constexpr (cols_per_warp == 8) {
         if (ncols2 > 1 || mask_h) {
@@ -532,7 +542,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
-                    KQ_max_new[l % 2] = fmaxf(KQ_max_new[l % 2], KQ_C[k0/(np*T_C_KQ::I)].x[l] + FATTN_KQ_MAX_OFFSET);
+                    KQ_max_new[l % 2] = fmaxf(KQ_max_new[l % 2], KQ_C[k0/(np*T_C_KQ::I)].x[l] + kq_max_offset);
                 }
             }
         }
@@ -585,7 +595,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
                     // Turing + Volta:
-                    KQ_max_new[(l/2) % 2] = fmaxf(KQ_max_new[(l/2) % 2], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + FATTN_KQ_MAX_OFFSET);
+                    KQ_max_new[(l/2) % 2] = fmaxf(KQ_max_new[(l/2) % 2], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + kq_max_offset);
                 }
             }
         }
@@ -1296,8 +1306,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            if (!(KQ_rowsum_j > 0.0f)) {
+                                dstk_val = make_float2(0.0f, 0.0f);
+                            } else {
+                                dstk_val.x /= KQ_rowsum_j;
+                                dstk_val.y /= KQ_rowsum_j;
+                            }
                         }
 
                         if (is_fixup) {
