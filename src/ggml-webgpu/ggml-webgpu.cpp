@@ -386,6 +386,7 @@ struct webgpu_context_struct {
     std::map<int, std::map<int, webgpu_pipeline>> get_rows_pipelines;                 // src_type, vectorized
 
     std::map<int, std::map<int, webgpu_pipeline>> cpy_pipelines;                      // src_type, dst_type
+    std::map<int, webgpu_pipeline>                repeat_pipelines;                   // type
     std::map<int, webgpu_pipeline>                concat_pipelines;                   // type
     std::map<int, std::map<int, webgpu_pipeline>> add_pipelines;                      // type, inplace
     std::map<int, std::map<int, webgpu_pipeline>> sub_pipelines;                      // type, inplace
@@ -927,6 +928,51 @@ static webgpu_command ggml_webgpu_cpy(webgpu_context & ctx, ggml_tensor * src, g
     uint32_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->cpy_pipelines[src->type][dst->type],
                                      params, entries, wg_x);
+}
+
+static webgpu_command ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
+    const uint32_t ne            = (uint32_t) ggml_nelements(dst);
+    const uint32_t src_type_size = ggml_type_size(src->type);
+    const uint32_t dst_type_size = ggml_type_size(dst->type);
+
+    std::vector<uint32_t> params = {
+        ne,
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src) / src_type_size),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / dst_type_size),
+        // Strides (in elements)
+        (uint32_t) (src->nb[0] / src_type_size),
+        (uint32_t) (src->nb[1] / src_type_size),
+        (uint32_t) (src->nb[2] / src_type_size),
+        (uint32_t) (src->nb[3] / src_type_size),
+        (uint32_t) (dst->nb[0] / dst_type_size),
+        (uint32_t) (dst->nb[1] / dst_type_size),
+        (uint32_t) (dst->nb[2] / dst_type_size),
+        (uint32_t) (dst->nb[3] / dst_type_size),
+        // Shapes
+        (uint32_t) src->ne[0],
+        (uint32_t) src->ne[1],
+        (uint32_t) src->ne[2],
+        (uint32_t) src->ne[3],
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+        (uint32_t) dst->ne[3],
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries = {
+        { .binding = 0,
+         .buffer  = ggml_webgpu_tensor_buf(src),
+         .offset  = ggml_webgpu_tensor_align_offset(ctx, src),
+         .size    = ggml_webgpu_tensor_binding_size(ctx, src) },
+        { .binding = 1,
+         .buffer  = ggml_webgpu_tensor_buf(dst),
+         .offset  = ggml_webgpu_tensor_align_offset(ctx, dst),
+         .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
+    };
+
+    const uint32_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->repeat_pipelines[dst->type], params,
+                                     entries, wg_x);
 }
 
 static webgpu_command ggml_webgpu_im2col(webgpu_context & ctx,
@@ -2496,6 +2542,8 @@ static std::optional<webgpu_command> ggml_webgpu_encode_node(webgpu_context ctx,
             return ggml_webgpu_mul_mat(ctx, src0, src1, node);
         case GGML_OP_IM2COL:
             return ggml_webgpu_im2col(ctx, src0, src1, node);
+        case GGML_OP_REPEAT:
+            return ggml_webgpu_repeat(ctx, src0, node);
         case GGML_OP_FLASH_ATTN_EXT:
 #ifndef __EMSCRIPTEN__
             return ggml_webgpu_flash_attn(ctx, src0, src1, src2, node->src[3], node->src[4], node);
@@ -3185,6 +3233,17 @@ static void ggml_webgpu_init_cpy_pipeline(webgpu_context & webgpu_ctx) {
         ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_cpy_f16_f16, "cpy_f16_f16", constants);
 }
 
+static void ggml_webgpu_init_repeat_pipeline(webgpu_context & webgpu_ctx) {
+    std::vector<wgpu::ConstantEntry> constants = ggml_webgpu_wg_size_entry(WEBGPU_MAX_WG_SIZE);
+
+    webgpu_ctx->repeat_pipelines[GGML_TYPE_F32] =
+        ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_repeat_f32, "repeat_f32", constants);
+    webgpu_ctx->repeat_pipelines[GGML_TYPE_F16] =
+        ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_repeat_f16, "repeat_f16", constants);
+    webgpu_ctx->repeat_pipelines[GGML_TYPE_I32] =
+        ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_repeat_i32, "repeat_i32", constants);
+}
+
 static void ggml_webgpu_init_im2col_pipeline(webgpu_context & webgpu_ctx) {
     std::vector<wgpu::ConstantEntry> constants = ggml_webgpu_wg_size_entry(WEBGPU_MAX_WG_SIZE);
 
@@ -3615,6 +3674,7 @@ static webgpu_context initialize_webgpu_context(ggml_backend_dev_t dev) {
     ggml_webgpu_init_mul_mat_pipeline(webgpu_ctx);
     ggml_webgpu_init_get_rows_pipeline(webgpu_ctx);
     ggml_webgpu_init_cpy_pipeline(webgpu_ctx);
+    ggml_webgpu_init_repeat_pipeline(webgpu_ctx);
     ggml_webgpu_init_im2col_pipeline(webgpu_ctx);
     ggml_webgpu_init_group_norm_pipeline(webgpu_ctx);
     ggml_webgpu_init_timestep_embedding_pipeline(webgpu_ctx);
@@ -3847,6 +3907,27 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
                 supports_op = (work_x > 0) && (work_x <= max_wg) && (OH > 0) && (OH <= max_wg);
+                break;
+            }
+        case GGML_OP_REPEAT:
+            {
+                if (src0 == nullptr) {
+                    break;
+                }
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_I32) {
+                    break;
+                }
+                if (src0->type != op->type) {
+                    break;
+                }
+                if (!ggml_can_repeat(src0, op)) {
+                    break;
+                }
+
+                const uint64_t ne     = (uint64_t) ggml_nelements(op);
+                const uint64_t wg_x   = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+                const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+                supports_op            = ne > 0 && ne <= UINT32_MAX && wg_x > 0 && wg_x <= max_wg;
                 break;
             }
         case GGML_OP_GROUP_NORM:
