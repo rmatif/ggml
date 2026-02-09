@@ -34,6 +34,22 @@
     "DECLS": ["INPLACE"]
   },
   {
+    "SHADER_NAME": "add_f32_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f32",
+      "OP": "+"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
+    "SHADER_NAME": "add_f16_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f16",
+      "OP": "+"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
     "SHADER_NAME": "mul_f32",
     "REPLS": {
       "TYPE" : "f32",
@@ -64,6 +80,22 @@
       "OP": "*"
     },
     "DECLS": ["INPLACE"]
+  },
+  {
+    "SHADER_NAME": "mul_f32_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f32",
+      "OP": "*"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
+    "SHADER_NAME": "mul_f16_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f16",
+      "OP": "*"
+    },
+    "DECLS": ["INPLACE_SRC1"]
   },
   {
     "SHADER_NAME": "sub_f32",
@@ -98,6 +130,22 @@
     "DECLS": ["INPLACE"]
   },
   {
+    "SHADER_NAME": "sub_f32_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f32",
+      "OP": "-"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
+    "SHADER_NAME": "sub_f16_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f16",
+      "OP": "-"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
     "SHADER_NAME": "div_f32",
     "REPLS": {
       "TYPE" : "f32",
@@ -128,6 +176,22 @@
       "OP": "/"
     },
     "DECLS": ["INPLACE"]
+  },
+  {
+    "SHADER_NAME": "div_f32_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f32",
+      "OP": "/"
+    },
+    "DECLS": ["INPLACE_SRC1"]
+  },
+  {
+    "SHADER_NAME": "div_f16_inplace_src1",
+    "REPLS": {
+      "TYPE" : "f16",
+      "OP": "/"
+    },
+    "DECLS": ["INPLACE_SRC1"]
   }
 ]
 
@@ -160,6 +224,17 @@ var<uniform> params: Params;
 
 #enddecl(INPLACE)
 
+#decl(INPLACE_SRC1)
+
+fn update(dst_i: u32, src0_i: u32, src1_i: u32) {
+    src1[dst_i] = src0[src0_i] {{OP}} src1[src1_i];
+}
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+#enddecl(INPLACE_SRC1)
+
 #end(DECLS)
 
 
@@ -181,7 +256,8 @@ override wg_size: u32;
 @compute @workgroup_size(wg_size)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x < params.ne) {
-        update(params.offset_dst + gid.x, params.offset_src0 + gid.x, params.offset_src1 + src1_index(gid.x));
+        let a = a_indices(gid.x);
+        update(params.offset_dst + dst_index(a), params.offset_src0 + src0_index(a), params.offset_src1 + src1_index(a));
     }
 }
 
