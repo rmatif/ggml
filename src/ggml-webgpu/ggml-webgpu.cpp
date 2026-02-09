@@ -86,6 +86,7 @@
 
 // For operations which process a row in parallel, this seems like a reasonable default
 #define WEBGPU_ROW_SPLIT_WG_SIZE 64
+#define WEBGPU_IM2COL_WG_SIZE    256
 
 // CONV_2D tiled kernel parameters (K x NPQ x CRS formulation)
 #define WEBGPU_CONV2D_BS_K       64
@@ -137,6 +138,23 @@ static wgpu::PowerPreference ggml_webgpu_get_power_preference() {
 
     // Unknown value: keep behavior deterministic and fast.
     return wgpu::PowerPreference::HighPerformance;
+}
+
+// See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
+// For unsigned division n / d with d > 0:
+// n / d = (mulhi(n, mp) + n) >> L, where mp is precomputed from d.
+static uint32_t ggml_webgpu_fastdiv_mp(uint32_t d) {
+    GGML_ASSERT(d > 0);
+
+    uint32_t L = 0;
+    while (L < 32 && (uint64_t{ 1 } << L) < d) {
+        ++L;
+    }
+
+    const uint64_t two_pow_L = uint64_t{ 1 } << L;
+    const uint64_t numerator = (uint64_t{ 1 } << 32) * (two_pow_L - d);
+    const uint64_t mp_u64    = numerator / d + 1u;
+    return (uint32_t) mp_u64;
 }
 
 static bool ggml_webgpu_dispatch_1d_to_2d(uint64_t total_wg, uint32_t max_wg, uint32_t & wg_x, uint32_t & wg_y) {
@@ -1085,10 +1103,27 @@ static webgpu_command ggml_webgpu_im2col(webgpu_context & ctx,
     const uint32_t offset_delta = (uint32_t) (src1->nb[is_2D ? 2 : 1] / sizeof(float));
     const uint32_t batch_offset = (uint32_t) (src1->nb[is_2D ? 3 : 2] / sizeof(float));
 
-    const uint32_t pelements = OW * KW * KH;
-    const uint32_t batch     = (uint32_t) src1->ne[is_2D ? 3 : 2];
-    const uint32_t batch_ic  = batch * IC;
-    const uint32_t chw       = IC * KH * KW;
+    const uint64_t ksize_u64     = (uint64_t) OW * (uint64_t) KH;
+    const uint64_t chw_u64       = (uint64_t) IC * (uint64_t) KH * (uint64_t) KW;
+    const uint64_t pelements_u64 = (uint64_t) OW * (uint64_t) KW * (uint64_t) KH;
+    const uint32_t batch         = (uint32_t) src1->ne[is_2D ? 3 : 2];
+    const uint64_t batch_ic_u64  = (uint64_t) batch * (uint64_t) IC;
+    GGML_ASSERT(ksize_u64 <= UINT32_MAX);
+    GGML_ASSERT(chw_u64 <= UINT32_MAX);
+    GGML_ASSERT(pelements_u64 <= UINT32_MAX);
+    GGML_ASSERT(batch_ic_u64 <= UINT32_MAX);
+    const uint32_t ksize     = (uint32_t) ksize_u64;
+    const uint32_t pelements = (uint32_t) pelements_u64;
+    const uint32_t batch_ic  = (uint32_t) batch_ic_u64;
+    const uint32_t chw       = (uint32_t) chw_u64;
+
+    const bool im2col_fast_path = is_2D && s0 == 1 && s1 == 1 && d0 == 1 && d1 == 1;
+    const uint32_t pelements_mp = ggml_webgpu_fastdiv_mp(pelements);
+    const uint32_t ic_mp        = ggml_webgpu_fastdiv_mp(IC);
+    const uint32_t ksize_mp     = ggml_webgpu_fastdiv_mp(ksize);
+    const uint32_t ow_mp        = ggml_webgpu_fastdiv_mp(OW);
+    const uint32_t pelements_vec = (uint32_t) CEIL_DIV((uint64_t) pelements, (uint64_t) 4);
+    const uint32_t pelements_vec_mp = ggml_webgpu_fastdiv_mp(pelements_vec);
 
     std::vector<uint32_t> params = {
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)),
@@ -1116,6 +1151,13 @@ static webgpu_command ggml_webgpu_im2col(webgpu_context & ctx,
         (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
         (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
         (uint32_t) (is_2D ? 1 : 0),
+        pelements_mp,
+        ic_mp,
+        ksize_mp,
+        ow_mp,
+        pelements_vec,
+        pelements_vec_mp,
+        (uint32_t) (im2col_fast_path ? 1 : 0),
     };
 
     std::vector<wgpu::BindGroupEntry> entries = {
@@ -1129,8 +1171,10 @@ static webgpu_command ggml_webgpu_im2col(webgpu_context & ctx,
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
     };
 
-    const uint64_t threads = (uint64_t) pelements * (uint64_t) batch_ic;
-    uint32_t       wg_x    = (uint32_t) CEIL_DIV(threads, WEBGPU_MAX_WG_SIZE);
+    const uint64_t logical_elems = im2col_fast_path
+                                       ? (uint64_t) pelements_vec * (uint64_t) batch_ic
+                                       : (uint64_t) pelements * (uint64_t) batch_ic;
+    uint32_t       wg_x          = (uint32_t) CEIL_DIV(logical_elems, WEBGPU_IM2COL_WG_SIZE);
     uint32_t       wg_y    = OH;
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->im2col_pipelines[dst->type], params,
                                      entries, wg_x, wg_y);
@@ -3338,7 +3382,7 @@ static void ggml_webgpu_init_conv2d_pipeline(webgpu_context & webgpu_ctx) {
 }
 
 static void ggml_webgpu_init_im2col_pipeline(webgpu_context & webgpu_ctx) {
-    std::vector<wgpu::ConstantEntry> constants = ggml_webgpu_wg_size_entry(WEBGPU_MAX_WG_SIZE);
+    std::vector<wgpu::ConstantEntry> constants = ggml_webgpu_wg_size_entry(WEBGPU_IM2COL_WG_SIZE);
 
     webgpu_ctx->im2col_pipelines[GGML_TYPE_F32] =
         ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_im2col_f32, "im2col_f32", constants);
@@ -3988,6 +4032,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 }
 
                 const bool    is_2D = ggml_get_op_params_i32(op, 6) == 1;
+                const int32_t s0    = ggml_get_op_params_i32(op, 0);
+                const int32_t s1    = ggml_get_op_params_i32(op, 1);
+                const int32_t d0    = ggml_get_op_params_i32(op, 4);
+                const int32_t d1    = ggml_get_op_params_i32(op, 5);
                 const uint64_t IC    = (uint64_t) src1->ne[is_2D ? 2 : 1];
                 const uint64_t KW    = (uint64_t) src0->ne[0];
                 const uint64_t KH    = (uint64_t) (is_2D ? src0->ne[1] : 1);
@@ -3997,7 +4045,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 const uint64_t pelements = OW * KW * KH;
                 const uint64_t batch_ic  = batch * IC;
-                const uint64_t work_x    = CEIL_DIV(pelements * batch_ic, WEBGPU_MAX_WG_SIZE);
+                const bool     fast_path = is_2D && s0 == 1 && s1 == 1 && d0 == 1 && d1 == 1;
+                const uint64_t logical_elems =
+                    fast_path ? CEIL_DIV(pelements, (uint64_t) 4) * batch_ic : pelements * batch_ic;
+                const uint64_t work_x = CEIL_DIV(logical_elems, WEBGPU_IM2COL_WG_SIZE);
 
                 const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
                 supports_op = (work_x > 0) && (work_x <= max_wg) && (OH > 0) && (OH <= max_wg);
