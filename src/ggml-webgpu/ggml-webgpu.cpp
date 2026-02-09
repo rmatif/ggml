@@ -87,6 +87,13 @@
 // For operations which process a row in parallel, this seems like a reasonable default
 #define WEBGPU_ROW_SPLIT_WG_SIZE 64
 
+// CONV_2D tiled kernel parameters (K x NPQ x CRS formulation)
+#define WEBGPU_CONV2D_BS_K       64
+#define WEBGPU_CONV2D_BS_NPQ     128
+#define WEBGPU_CONV2D_BS_CRS     16
+#define WEBGPU_CONV2D_TS_K       4
+#define WEBGPU_CONV2D_TS_NPQ     8
+
 // Matrix multiplication parameters
 
 // Register tiling parameters
@@ -387,6 +394,7 @@ struct webgpu_context_struct {
 
     std::map<int, std::map<int, webgpu_pipeline>> cpy_pipelines;                      // src_type, dst_type
     std::map<int, webgpu_pipeline>                repeat_pipelines;                   // type
+    std::map<int, webgpu_pipeline>                conv2d_pipelines;                   // kernel type
     std::map<int, webgpu_pipeline>                concat_pipelines;                   // type
     std::map<int, std::map<int, webgpu_pipeline>> add_pipelines;                      // type, inplace
     std::map<int, std::map<int, webgpu_pipeline>> sub_pipelines;                      // type, inplace
@@ -973,6 +981,82 @@ static webgpu_command ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * src
     const uint32_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->repeat_pipelines[dst->type], params,
                                      entries, wg_x);
+}
+
+static webgpu_command ggml_webgpu_conv_2d(webgpu_context & ctx,
+                                          ggml_tensor *    kernel,
+                                          ggml_tensor *    src,
+                                          ggml_tensor *    dst) {
+    const uint32_t kernel_type_size = ggml_type_size(kernel->type);
+    const uint32_t src_type_size    = ggml_type_size(src->type);
+    const uint32_t dst_type_size    = ggml_type_size(dst->type);
+
+    const uint32_t s0 = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t s1 = (uint32_t) ggml_get_op_params_i32(dst, 1);
+    const uint32_t p0 = (uint32_t) ggml_get_op_params_i32(dst, 2);
+    const uint32_t p1 = (uint32_t) ggml_get_op_params_i32(dst, 3);
+    const uint32_t d0 = (uint32_t) ggml_get_op_params_i32(dst, 4);
+    const uint32_t d1 = (uint32_t) ggml_get_op_params_i32(dst, 5);
+
+    std::vector<uint32_t> params = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, kernel) / kernel_type_size),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src) / src_type_size),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / dst_type_size),
+
+        (uint32_t) dst->ne[2], // Cout
+        (uint32_t) src->ne[2], // Cin
+        (uint32_t) src->ne[3], // N
+        (uint32_t) kernel->ne[0], // KW
+        (uint32_t) kernel->ne[1], // KH
+        (uint32_t) src->ne[0], // W
+        (uint32_t) src->ne[1], // H
+        (uint32_t) dst->ne[0], // OW
+        (uint32_t) dst->ne[1], // OH
+
+        s0,
+        s1,
+        p0,
+        p1,
+        d0,
+        d1,
+
+        (uint32_t) (kernel->nb[0] / kernel_type_size),
+        (uint32_t) (kernel->nb[1] / kernel_type_size),
+        (uint32_t) (kernel->nb[2] / kernel_type_size),
+        (uint32_t) (kernel->nb[3] / kernel_type_size),
+
+        (uint32_t) (src->nb[0] / src_type_size),
+        (uint32_t) (src->nb[1] / src_type_size),
+        (uint32_t) (src->nb[2] / src_type_size),
+        (uint32_t) (src->nb[3] / src_type_size),
+
+        (uint32_t) (dst->nb[0] / dst_type_size),
+        (uint32_t) (dst->nb[1] / dst_type_size),
+        (uint32_t) (dst->nb[2] / dst_type_size),
+        (uint32_t) (dst->nb[3] / dst_type_size),
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries = {
+        { .binding = 0,
+         .buffer  = ggml_webgpu_tensor_buf(kernel),
+         .offset  = ggml_webgpu_tensor_align_offset(ctx, kernel),
+         .size    = ggml_webgpu_tensor_binding_size(ctx, kernel) },
+        { .binding = 1,
+         .buffer  = ggml_webgpu_tensor_buf(src),
+         .offset  = ggml_webgpu_tensor_align_offset(ctx, src),
+         .size    = ggml_webgpu_tensor_binding_size(ctx, src) },
+        { .binding = 2,
+         .buffer  = ggml_webgpu_tensor_buf(dst),
+         .offset  = ggml_webgpu_tensor_align_offset(ctx, dst),
+         .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
+    };
+
+    const uint64_t npq = (uint64_t) src->ne[3] * (uint64_t) dst->ne[1] * (uint64_t) dst->ne[0];
+    const uint32_t wg_x = (uint32_t) CEIL_DIV((uint64_t) dst->ne[2], WEBGPU_CONV2D_BS_K);
+    const uint32_t wg_y = (uint32_t) CEIL_DIV(npq, WEBGPU_CONV2D_BS_NPQ);
+
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->conv2d_pipelines[kernel->type], params,
+                                     entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_im2col(webgpu_context & ctx,
@@ -2542,6 +2626,8 @@ static std::optional<webgpu_command> ggml_webgpu_encode_node(webgpu_context ctx,
             return ggml_webgpu_mul_mat(ctx, src0, src1, node);
         case GGML_OP_IM2COL:
             return ggml_webgpu_im2col(ctx, src0, src1, node);
+        case GGML_OP_CONV_2D:
+            return ggml_webgpu_conv_2d(ctx, src0, src1, node);
         case GGML_OP_REPEAT:
             return ggml_webgpu_repeat(ctx, src0, node);
         case GGML_OP_FLASH_ATTN_EXT:
@@ -3244,6 +3330,13 @@ static void ggml_webgpu_init_repeat_pipeline(webgpu_context & webgpu_ctx) {
         ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_repeat_i32, "repeat_i32", constants);
 }
 
+static void ggml_webgpu_init_conv2d_pipeline(webgpu_context & webgpu_ctx) {
+    webgpu_ctx->conv2d_pipelines[GGML_TYPE_F32] =
+        ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_conv2d_f32, "conv2d_f32");
+    webgpu_ctx->conv2d_pipelines[GGML_TYPE_F16] =
+        ggml_webgpu_create_pipeline(webgpu_ctx->global_ctx->device, wgsl_conv2d_f16, "conv2d_f16");
+}
+
 static void ggml_webgpu_init_im2col_pipeline(webgpu_context & webgpu_ctx) {
     std::vector<wgpu::ConstantEntry> constants = ggml_webgpu_wg_size_entry(WEBGPU_MAX_WG_SIZE);
 
@@ -3675,6 +3768,7 @@ static webgpu_context initialize_webgpu_context(ggml_backend_dev_t dev) {
     ggml_webgpu_init_get_rows_pipeline(webgpu_ctx);
     ggml_webgpu_init_cpy_pipeline(webgpu_ctx);
     ggml_webgpu_init_repeat_pipeline(webgpu_ctx);
+    ggml_webgpu_init_conv2d_pipeline(webgpu_ctx);
     ggml_webgpu_init_im2col_pipeline(webgpu_ctx);
     ggml_webgpu_init_group_norm_pipeline(webgpu_ctx);
     ggml_webgpu_init_timestep_embedding_pipeline(webgpu_ctx);
@@ -3907,6 +4001,73 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
 
                 const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
                 supports_op = (work_x > 0) && (work_x <= max_wg) && (OH > 0) && (OH <= max_wg);
+                break;
+            }
+        case GGML_OP_CONV_2D:
+            {
+                if (src0 == nullptr || src1 == nullptr) {
+                    break;
+                }
+                if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || src1->type != GGML_TYPE_F32 ||
+                    op->type != GGML_TYPE_F32) {
+                    break;
+                }
+                if (src0->ne[2] != src1->ne[2]) {
+                    break;
+                }
+
+                const int32_t s0 = ggml_get_op_params_i32(op, 0);
+                const int32_t s1 = ggml_get_op_params_i32(op, 1);
+                const int32_t p0 = ggml_get_op_params_i32(op, 2);
+                const int32_t p1 = ggml_get_op_params_i32(op, 3);
+                const int32_t d0 = ggml_get_op_params_i32(op, 4);
+                const int32_t d1 = ggml_get_op_params_i32(op, 5);
+                if (s0 <= 0 || s1 <= 0 || d0 <= 0 || d1 <= 0 || p0 < 0 || p1 < 0) {
+                    break;
+                }
+
+                auto calc_conv_output_size = [](int64_t ins, int64_t ks, int s, int p, int d) -> int64_t {
+                    return (ins + 2 * p - d * (ks - 1) - 1) / s + 1;
+                };
+                const int64_t ow = calc_conv_output_size(src1->ne[0], src0->ne[0], s0, p0, d0);
+                const int64_t oh = calc_conv_output_size(src1->ne[1], src0->ne[1], s1, p1, d1);
+                if (ow <= 0 || oh <= 0) {
+                    break;
+                }
+                if (op->ne[0] != ow || op->ne[1] != oh || op->ne[2] != src0->ne[3] || op->ne[3] != src1->ne[3]) {
+                    break;
+                }
+
+                const uint32_t src0_type_size = ggml_type_size(src0->type);
+                const uint32_t src1_type_size = ggml_type_size(src1->type);
+                const uint32_t dst_type_size  = ggml_type_size(op->type);
+                if ((src0->nb[0] % src0_type_size) != 0 || (src0->nb[1] % src0_type_size) != 0 ||
+                    (src0->nb[2] % src0_type_size) != 0 || (src0->nb[3] % src0_type_size) != 0 ||
+                    (src1->nb[0] % src1_type_size) != 0 || (src1->nb[1] % src1_type_size) != 0 ||
+                    (src1->nb[2] % src1_type_size) != 0 || (src1->nb[3] % src1_type_size) != 0 ||
+                    (op->nb[0] % dst_type_size) != 0 || (op->nb[1] % dst_type_size) != 0 ||
+                    (op->nb[2] % dst_type_size) != 0 || (op->nb[3] % dst_type_size) != 0) {
+                    break;
+                }
+
+                auto fits_u32 = [](uint64_t v) -> bool { return v <= UINT32_MAX; };
+                if (!fits_u32(src0->ne[0]) || !fits_u32(src0->ne[1]) || !fits_u32(src0->ne[2]) || !fits_u32(src0->ne[3]) ||
+                    !fits_u32(src1->ne[0]) || !fits_u32(src1->ne[1]) || !fits_u32(src1->ne[2]) || !fits_u32(src1->ne[3]) ||
+                    !fits_u32(op->ne[0]) || !fits_u32(op->ne[1]) || !fits_u32(op->ne[2]) || !fits_u32(op->ne[3]) ||
+                    !fits_u32(src0->nb[0] / src0_type_size) || !fits_u32(src0->nb[1] / src0_type_size) ||
+                    !fits_u32(src0->nb[2] / src0_type_size) || !fits_u32(src0->nb[3] / src0_type_size) ||
+                    !fits_u32(src1->nb[0] / src1_type_size) || !fits_u32(src1->nb[1] / src1_type_size) ||
+                    !fits_u32(src1->nb[2] / src1_type_size) || !fits_u32(src1->nb[3] / src1_type_size) ||
+                    !fits_u32(op->nb[0] / dst_type_size) || !fits_u32(op->nb[1] / dst_type_size) ||
+                    !fits_u32(op->nb[2] / dst_type_size) || !fits_u32(op->nb[3] / dst_type_size)) {
+                    break;
+                }
+
+                const uint64_t npq    = (uint64_t) op->ne[3] * (uint64_t) op->ne[1] * (uint64_t) op->ne[0];
+                const uint64_t wg_x   = CEIL_DIV((uint64_t) op->ne[2], WEBGPU_CONV2D_BS_K);
+                const uint64_t wg_y   = CEIL_DIV(npq, WEBGPU_CONV2D_BS_NPQ);
+                const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+                supports_op            = npq > 0 && wg_x > 0 && wg_x <= max_wg && wg_y > 0 && wg_y <= max_wg;
                 break;
             }
         case GGML_OP_REPEAT:
