@@ -1961,6 +1961,13 @@ static webgpu_command ggml_webgpu_binary_op(webgpu_context &  ctx,
     require_webgpu_tensor(src1, "src1");
     require_webgpu_tensor(dst, "dst");
 
+    if (src0->type != dst->type || src1->type != dst->type) {
+        GGML_ABORT("ggml_webgpu_binary_op: mixed dtypes are unsupported (src0=%s, src1=%s, dst=%s)",
+                   ggml_type_name(src0->type),
+                   ggml_type_name(src1->type),
+                   ggml_type_name(dst->type));
+    }
+
     std::vector<uint32_t> params = {
         (uint32_t) ggml_nelements(dst),
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type)),
