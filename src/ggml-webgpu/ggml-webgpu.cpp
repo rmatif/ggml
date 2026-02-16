@@ -3674,6 +3674,23 @@ static void ggml_webgpu_init_soft_max_pipeline(webgpu_context & webgpu_ctx) {
 static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     wgpu::RequestAdapterOptions options = {};
     const std::optional<wgpu::BackendType> forced_backend = ggml_webgpu_get_forced_backend();
+    struct backend_candidate {
+        bool              specified;
+        wgpu::BackendType type;
+    };
+    std::vector<backend_candidate> backend_candidates;
+    if (forced_backend.has_value()) {
+        backend_candidates.push_back({ true, *forced_backend });
+    } else {
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+        // Prefer Vulkan on Windows because D3D12 path is currently unstable for SDXL in this branch.
+        backend_candidates.push_back({ true, wgpu::BackendType::Vulkan });
+        backend_candidates.push_back({ true, wgpu::BackendType::D3D12 });
+#else
+        // Keep default backend selection behavior on other platforms.
+        backend_candidates.push_back({ false, wgpu::BackendType::D3D12 });
+#endif
+    }
 
 #ifndef __EMSCRIPTEN__
     // Keep the chain storage alive until RequestAdapter() completes.
@@ -3697,11 +3714,11 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->adapter = nullptr;
     ctx->webgpu_global_ctx->device  = nullptr;
 
-    auto try_request_adapter = [&](wgpu::PowerPreference power_preference) {
+    auto try_request_adapter = [&](wgpu::PowerPreference power_preference, backend_candidate candidate) {
         wgpu::RequestAdapterOptions request_options = options;
         request_options.powerPreference             = power_preference;
-        if (forced_backend.has_value()) {
-            request_options.backendType = *forced_backend;
+        if (candidate.specified) {
+            request_options.backendType = candidate.type;
         }
 
         wgpu::Adapter candidate_adapter;
@@ -3734,20 +3751,28 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     };
 
 #ifndef __EMSCRIPTEN__
-    if (forced_backend.has_value()) {
-        GGML_LOG_INFO("ggml_webgpu: forcing backend = %s\n", ggml_webgpu_backend_name(*forced_backend));
-    }
-
     const wgpu::PowerPreference requested = ggml_webgpu_get_power_preference();
     const wgpu::PowerPreference preferences[] = { requested, wgpu::PowerPreference::HighPerformance,
                                                   wgpu::PowerPreference::Undefined, wgpu::PowerPreference::LowPower };
-    for (wgpu::PowerPreference preference : preferences) {
-        if (try_request_adapter(preference)) {
+    for (backend_candidate candidate : backend_candidates) {
+        if (candidate.specified) {
+            if (forced_backend.has_value()) {
+                GGML_LOG_INFO("ggml_webgpu: forcing backend = %s\n", ggml_webgpu_backend_name(candidate.type));
+            } else {
+                GGML_LOG_INFO("ggml_webgpu: trying backend = %s\n", ggml_webgpu_backend_name(candidate.type));
+            }
+        }
+        for (wgpu::PowerPreference preference : preferences) {
+            if (try_request_adapter(preference, candidate)) {
+                break;
+            }
+        }
+        if (ctx->webgpu_global_ctx->adapter != nullptr) {
             break;
         }
     }
 #else
-    try_request_adapter(wgpu::PowerPreference::Undefined);
+    try_request_adapter(wgpu::PowerPreference::Undefined, backend_candidates[0]);
 #endif
 
     if (ctx->webgpu_global_ctx->adapter == nullptr) {
