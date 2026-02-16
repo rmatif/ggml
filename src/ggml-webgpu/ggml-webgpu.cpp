@@ -3644,35 +3644,82 @@ static void ggml_webgpu_init_soft_max_pipeline(webgpu_context & webgpu_ctx) {
 
 static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     wgpu::RequestAdapterOptions options = {};
-    options.powerPreference             = ggml_webgpu_get_power_preference();
 
 #ifndef __EMSCRIPTEN__
     // Keep the chain storage alive until RequestAdapter() completes.
     wgpu::DawnTogglesDescriptor adapterTogglesDesc = {};
-    const char * const          adapterEnabledToggles[] = { "vulkan_enable_f16_on_nvidia", "use_vulkan_memory_model" };
+    const char * const          adapterEnabledToggles[] = {
+        "vulkan_enable_f16_on_nvidia",
+        "use_vulkan_memory_model",
+        "use_dxc",
+    };
 
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
     // Keep an escape hatch for driver-specific issues when validating correctness.
     const char * disable_toggles = std::getenv("GGML_WEBGPU_DISABLE_DAWN_TOGGLES");
     if (disable_toggles == nullptr || strcmp(disable_toggles, "1") != 0) {
         adapterTogglesDesc.enabledToggles     = adapterEnabledToggles;
-        adapterTogglesDesc.enabledToggleCount = 2;
+        adapterTogglesDesc.enabledToggleCount = 3;
         options.nextInChain                   = &adapterTogglesDesc;
     }
 #endif
 
-    ctx->webgpu_global_ctx->instance.WaitAny(
-        ctx->webgpu_global_ctx->instance.RequestAdapter(
-            &options, wgpu::CallbackMode::AllowSpontaneous,
-            [&ctx](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, const char * message) {
-                if (status != wgpu::RequestAdapterStatus::Success) {
-                    GGML_LOG_ERROR("ggml_webgpu: Failed to get an adapter: %s\n", message);
-                    return;
-                }
-                ctx->webgpu_global_ctx->adapter = std::move(adapter);
-            }),
-        UINT64_MAX);
-    GGML_ASSERT(ctx->webgpu_global_ctx->adapter != nullptr);
+    ctx->webgpu_global_ctx->adapter = nullptr;
+    ctx->webgpu_global_ctx->device  = nullptr;
+
+    auto try_request_adapter = [&](wgpu::PowerPreference power_preference) {
+        wgpu::RequestAdapterOptions request_options = options;
+        request_options.powerPreference             = power_preference;
+
+        wgpu::Adapter candidate_adapter;
+        ctx->webgpu_global_ctx->instance.WaitAny(
+            ctx->webgpu_global_ctx->instance.RequestAdapter(
+                &request_options, wgpu::CallbackMode::AllowSpontaneous,
+                [&candidate_adapter](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, const char * message) {
+                    if (status != wgpu::RequestAdapterStatus::Success) {
+                        GGML_LOG_ERROR("ggml_webgpu: Failed to get an adapter: %s\n", message ? message : "(null)");
+                        return;
+                    }
+                    candidate_adapter = std::move(adapter);
+                }),
+            UINT64_MAX);
+
+        if (candidate_adapter == nullptr) {
+            return false;
+        }
+
+        if (!candidate_adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+            wgpu::AdapterInfo candidate_info{};
+            candidate_adapter.GetInfo(&candidate_info);
+            GGML_LOG_WARN("ggml_webgpu: Skipping adapter without ShaderF16 support: %s\n",
+                          std::string(candidate_info.device).c_str());
+            return false;
+        }
+
+        ctx->webgpu_global_ctx->adapter = std::move(candidate_adapter);
+        return true;
+    };
+
+#ifndef __EMSCRIPTEN__
+    // Prefer the high-performance adapter to maximize the chance of ShaderF16 support.
+    const wgpu::PowerPreference preferences[] = {
+        wgpu::PowerPreference::HighPerformance,
+        wgpu::PowerPreference::Undefined,
+        wgpu::PowerPreference::LowPower,
+    };
+    for (wgpu::PowerPreference preference : preferences) {
+        if (try_request_adapter(preference)) {
+            break;
+        }
+    }
+#else
+    try_request_adapter(wgpu::PowerPreference::Undefined);
+#endif
+
+    if (ctx->webgpu_global_ctx->adapter == nullptr) {
+        GGML_LOG_ERROR("ggml_webgpu: No suitable WebGPU adapter found (ShaderF16 is required)\n");
+        return false;
+    }
 
     ctx->webgpu_global_ctx->adapter.GetLimits(&ctx->webgpu_global_ctx->capabilities.limits);
 
@@ -3686,8 +3733,6 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->adapter.GetInfo(&info);
     wgpu::SupportedFeatures features;
     ctx->webgpu_global_ctx->adapter.GetFeatures(&features);
-    // we require f16 support
-    GGML_ASSERT(ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::ShaderF16));
 
 #ifndef __EMSCRIPTEN__
     // Only support square f16 matrices of size 8 or 16 for now
@@ -3735,12 +3780,12 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     dev_desc.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device & device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+            if (reason == wgpu::DeviceLostReason::Destroyed) {
+                return;
+            }
             GGML_UNUSED(device);
-            GGML_UNUSED(reason);
-            GGML_UNUSED(message);
-            //TODO: uncomment once proper free logic is in place
-            //GGML_LOG_ERROR("ggml_webgpu: Device lost! Reason: %d, Message: %s\n", static_cast<int>(reason),
-            //std::string(message).c_str());
+            GGML_LOG_ERROR("ggml_webgpu: Device lost! Reason: %d, Message: %s\n", static_cast<int>(reason),
+                           std::string(message).c_str());
         });
     dev_desc.SetUncapturedErrorCallback(
         [](const wgpu::Device & device, wgpu::ErrorType reason, wgpu::StringView message) {
@@ -3779,7 +3824,10 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
                 ctx->webgpu_global_ctx->device = std::move(device);
             }),
         UINT64_MAX);
-    GGML_ASSERT(ctx->webgpu_global_ctx->device != nullptr);
+    if (ctx->webgpu_global_ctx->device == nullptr) {
+        GGML_LOG_ERROR("ggml_webgpu: Failed to initialize a WebGPU device\n");
+        return false;
+    }
 
     ggml_webgpu_init_memset_pipeline(ctx->webgpu_global_ctx);
     ctx->webgpu_global_ctx->memset_buf_pool.init(ctx->webgpu_global_ctx->device, 1, WEBGPU_PARAMS_BUF_SIZE_BYTES,
@@ -4025,6 +4073,11 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_IM2COL:
             {
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+                // On Windows/D3D12 in this revision, IM2COL can trigger invalid command lists.
+                // Force scheduler fallback to CPU for correctness/stability.
+                break;
+#endif
                 if (src1->type != GGML_TYPE_F32) {
                     break;
                 }
@@ -4063,6 +4116,11 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_CONV_2D:
             {
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+                // On Windows/D3D12 in this revision, CONV_2D can trigger device loss.
+                // Force scheduler fallback to CPU for correctness/stability.
+                break;
+#endif
                 if (src0 == nullptr || src1 == nullptr) {
                     break;
                 }

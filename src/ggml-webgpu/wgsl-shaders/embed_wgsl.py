@@ -61,7 +61,23 @@ def write_shader(shader_name, shader_code, output_dir, outfile):
         wgsl_filename = os.path.join(output_dir, f"{shader_name}.wgsl")
         with open(wgsl_filename, "w", encoding="utf-8") as f_out:
             f_out.write(shader_code)
-    outfile.write(f'const char* wgsl_{shader_name} = R"({shader_code})";\n\n')
+    # MSVC has a per-string-literal size limit; emit concatenated escaped chunks.
+    chunk_size = 8000
+    outfile.write(f"const char* wgsl_{shader_name} =\n")
+    if not shader_code:
+        outfile.write('    ""\n')
+    else:
+        for i in range(0, len(shader_code), chunk_size):
+            chunk = shader_code[i : i + chunk_size]
+            escaped = (
+                chunk.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+            )
+            outfile.write(f'    "{escaped}"\n')
+    outfile.write(";\n\n")
 
 
 def generate_variants(fname, input_dir, output_dir, outfile):

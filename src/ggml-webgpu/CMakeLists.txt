@@ -36,6 +36,9 @@ ggml_add_backend_library(ggml-webgpu
 
 add_dependencies(ggml-webgpu generate_shaders)
 
+# ggml-webgpu uses designated initializers in a few places; MSVC requires C++20 for this.
+target_compile_features(ggml-webgpu PRIVATE cxx_std_20)
+
 if(EMSCRIPTEN)
     set(EMDAWNWEBGPU_DIR "" CACHE PATH "Path to emdawnwebgpu_pkg")
 
