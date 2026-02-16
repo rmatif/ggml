@@ -140,6 +140,35 @@ static wgpu::PowerPreference ggml_webgpu_get_power_preference() {
     return wgpu::PowerPreference::HighPerformance;
 }
 
+static std::optional<wgpu::BackendType> ggml_webgpu_get_forced_backend() {
+    const char * backend = std::getenv("GGML_WEBGPU_BACKEND");
+    if (backend == nullptr || backend[0] == '\0' || strcmp(backend, "auto") == 0) {
+        return std::nullopt;
+    }
+
+    if (strcmp(backend, "vulkan") == 0 || strcmp(backend, "vk") == 0) {
+        return wgpu::BackendType::Vulkan;
+    }
+
+    if (strcmp(backend, "d3d12") == 0 || strcmp(backend, "dx12") == 0) {
+        return wgpu::BackendType::D3D12;
+    }
+
+    GGML_LOG_WARN("ggml_webgpu: Unknown GGML_WEBGPU_BACKEND='%s', using automatic backend selection\n", backend);
+    return std::nullopt;
+}
+
+static const char * ggml_webgpu_backend_name(wgpu::BackendType backend) {
+    switch (backend) {
+        case wgpu::BackendType::D3D12:
+            return "D3D12";
+        case wgpu::BackendType::Vulkan:
+            return "Vulkan";
+        default:
+            return "Unknown";
+    }
+}
+
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // For unsigned division n / d with d > 0:
 // n / d = (mulhi(n, mp) + n) >> L, where mp is precomputed from d.
@@ -3644,6 +3673,7 @@ static void ggml_webgpu_init_soft_max_pipeline(webgpu_context & webgpu_ctx) {
 
 static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     wgpu::RequestAdapterOptions options = {};
+    const std::optional<wgpu::BackendType> forced_backend = ggml_webgpu_get_forced_backend();
 
 #ifndef __EMSCRIPTEN__
     // Keep the chain storage alive until RequestAdapter() completes.
@@ -3670,6 +3700,9 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     auto try_request_adapter = [&](wgpu::PowerPreference power_preference) {
         wgpu::RequestAdapterOptions request_options = options;
         request_options.powerPreference             = power_preference;
+        if (forced_backend.has_value()) {
+            request_options.backendType = *forced_backend;
+        }
 
         wgpu::Adapter candidate_adapter;
         ctx->webgpu_global_ctx->instance.WaitAny(
@@ -3701,12 +3734,13 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     };
 
 #ifndef __EMSCRIPTEN__
-    // Prefer the high-performance adapter to maximize the chance of ShaderF16 support.
-    const wgpu::PowerPreference preferences[] = {
-        wgpu::PowerPreference::HighPerformance,
-        wgpu::PowerPreference::Undefined,
-        wgpu::PowerPreference::LowPower,
-    };
+    if (forced_backend.has_value()) {
+        GGML_LOG_INFO("ggml_webgpu: forcing backend = %s\n", ggml_webgpu_backend_name(*forced_backend));
+    }
+
+    const wgpu::PowerPreference requested = ggml_webgpu_get_power_preference();
+    const wgpu::PowerPreference preferences[] = { requested, wgpu::PowerPreference::HighPerformance,
+                                                  wgpu::PowerPreference::Undefined, wgpu::PowerPreference::LowPower };
     for (wgpu::PowerPreference preference : preferences) {
         if (try_request_adapter(preference)) {
             break;
@@ -3717,7 +3751,13 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
 #endif
 
     if (ctx->webgpu_global_ctx->adapter == nullptr) {
-        GGML_LOG_ERROR("ggml_webgpu: No suitable WebGPU adapter found (ShaderF16 is required)\n");
+        if (forced_backend.has_value()) {
+            GGML_LOG_ERROR(
+                "ggml_webgpu: No suitable WebGPU adapter found for forced backend %s (ShaderF16 is required)\n",
+                ggml_webgpu_backend_name(*forced_backend));
+        } else {
+            GGML_LOG_ERROR("ggml_webgpu: No suitable WebGPU adapter found (ShaderF16 is required)\n");
+        }
         return false;
     }
 
@@ -4073,11 +4113,6 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_IM2COL:
             {
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-                // On Windows/D3D12 in this revision, IM2COL can trigger invalid command lists.
-                // Force scheduler fallback to CPU for correctness/stability.
-                break;
-#endif
                 if (src1->type != GGML_TYPE_F32) {
                     break;
                 }
@@ -4116,11 +4151,6 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_CONV_2D:
             {
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-                // On Windows/D3D12 in this revision, CONV_2D can trigger device loss.
-                // Force scheduler fallback to CPU for correctness/stability.
-                break;
-#endif
                 if (src0 == nullptr || src1 == nullptr) {
                     break;
                 }
