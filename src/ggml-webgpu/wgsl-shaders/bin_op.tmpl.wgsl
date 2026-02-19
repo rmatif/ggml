@@ -254,9 +254,12 @@ DECLS
 
 override wg_size: u32;
 @compute @workgroup_size(wg_size)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x < params.ne) {
-        let a = a_indices(gid.x);
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let idx = (wg_id.y * num_wg.x + wg_id.x) * wg_size + local_id.x;
+    if (idx < params.ne) {
+        let a = a_indices(idx);
         update(params.offset_dst + dst_index(a), params.offset_src0 + src0_index(a), params.offset_src1 + src1_index(a));
     }
 }

@@ -45,12 +45,15 @@ fn wrap_around(idx: i32, n: u32) -> u32 {
 }
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let idx = (wg_id.y * num_wg.x + wg_id.x) * WG_SIZE + local_id.x;
+    if (idx >= params.ne) {
         return;
     }
 
-    var i = gid.x;
+    var i = idx;
     let dst_plane = params.dst_ne2 * params.dst_ne1 * params.dst_ne0;
     let i3 = i / dst_plane;
     i = i % dst_plane;
@@ -82,5 +85,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 #endif
 
-    dst[params.offset_dst + gid.x] = value;
+    dst[params.offset_dst + idx] = value;
 }

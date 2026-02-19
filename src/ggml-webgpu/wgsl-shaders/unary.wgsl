@@ -52,11 +52,14 @@ struct Params {
 var<uniform> params: Params;
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let idx = (wg_id.y * num_wg.x + wg_id.x) * WG_SIZE + local_id.x;
+    if (idx >= params.ne) {
       return;
     }
-    var i = gid.x;
+    var i = idx;
     let i3 = i / (params.ne2 * params.ne1 * params.ne0);
     i = i % (params.ne2 * params.ne1 * params.ne0);
     let i2 = i / (params.ne1 * params.ne0);
@@ -116,10 +119,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
               min(1.0, max(0.0, (src[params.offset_src + src_idx] + 3.0) / 6.0));
 #endif
 #ifdef GELU
-    let res = 0.5 * src[params.offset_src + src_idx] *
-              (1.0 + tanh(clamp(sqrt(2.0 / 3.14159265) *
-                               (src[params.offset_src + src_idx] +
-                                0.044715 * pow(src[params.offset_src + src_idx], 3.0)),
+    let x = src[params.offset_src + src_idx];
+    let x3 = x * x * x;
+    let res = 0.5 * x *
+              (1.0 + tanh(clamp(0.79788456 *
+                               (x + 0.044715 * x3),
                                -9.010913, 9.010913)));
 #endif
 #ifdef GELU_QUICK
@@ -174,6 +178,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 #ifdef INPLACE
     src[params.offset_src + src_idx] = res;
 #else
-    dst[params.offset_dst + gid.x] = res;
+    dst[params.offset_dst + idx] = res;
 #endif
 }
