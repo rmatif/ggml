@@ -980,9 +980,14 @@ static webgpu_command ggml_webgpu_cpy(webgpu_context & ctx, ggml_tensor * src, g
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
     };
 
-    uint32_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(CEIL_DIV((uint64_t) ne, (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: CPY dispatch exceeds device workgroup limits");
+    }
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->cpy_pipelines[src->type][dst->type],
-                                     params, entries, wg_x);
+                                     params, entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
@@ -1025,9 +1030,14 @@ static webgpu_command ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * src
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
     };
 
-    const uint32_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(CEIL_DIV((uint64_t) ne, (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: REPEAT dispatch exceeds device workgroup limits");
+    }
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->repeat_pipelines[dst->type], params,
-                                     entries, wg_x);
+                                     entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_conv_2d(webgpu_context & ctx,
@@ -1337,9 +1347,15 @@ static webgpu_command ggml_webgpu_concat(webgpu_context & ctx, ggml_tensor * src
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) },
     };
 
-    uint32_t wg_x = CEIL_DIV((uint32_t) ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: CONCAT dispatch exceeds device workgroup limits");
+    }
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->concat_pipelines[dst->type], params,
-                                     entries, wg_x);
+                                     entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_upscale(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
@@ -1400,8 +1416,15 @@ static webgpu_command ggml_webgpu_upscale(webgpu_context & ctx, ggml_tensor * sr
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) },
     };
 
-    uint32_t wg_x = CEIL_DIV((uint32_t) ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->upscale_pipeline, params, entries, wg_x);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: UPSCALE dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->upscale_pipeline, params, entries, wg_x,
+                                     wg_y);
 }
 
 static webgpu_command ggml_webgpu_pad(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
@@ -1474,8 +1497,13 @@ static webgpu_command ggml_webgpu_pad(webgpu_context & ctx, ggml_tensor * src, g
          .size    = ggml_webgpu_tensor_binding_size(ctx, dst) }
     };
 
-    uint32_t wg_x = CEIL_DIV(ne, decisions.wg_size);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(CEIL_DIV((uint64_t) ne, (uint64_t) decisions.wg_size), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: PAD dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x, wg_y);
 }
 
 static std::optional<webgpu_command> ggml_webgpu_set_rows(webgpu_context & ctx,
@@ -1715,22 +1743,22 @@ static webgpu_command ggml_webgpu_mul_mat(webgpu_context & ctx,
 #endif
 
             const uint64_t fast_wg = (uint64_t) wg_m * (uint64_t) wg_n * (uint64_t) dst->ne[2] * (uint64_t) dst->ne[3];
-            if (fast_wg > UINT32_MAX) {
+            if (!ggml_webgpu_dispatch_1d_to_2d(fast_wg, max_wg, wg_x, wg_y)) {
                 use_fast = false;
-            } else {
-                wg_x = (uint32_t) fast_wg;
-                wg_y = 1;
             }
         }
     }
 
-    // The fast tiled matmul shaders use 1D workgroup indexing and do not flatten y.
-    // If x exceeds the backend limit, fall back to the reference shader path.
-    if (use_fast && wg_x > max_wg) {
-        use_fast = false;
-    }
-
     if (!use_fast) {
+        const bool requires_fast_tile =
+            (src1->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16) ||
+            (src1->type == GGML_TYPE_F32 &&
+             (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q4_0));
+
+        if (requires_fast_tile) {
+            GGML_ABORT("ggml_webgpu: MUL_MAT fast tiled dispatch exceeds device workgroup limits");
+        }
+
         pipeline = ctx->mul_mat_pipelines[src0->type][src1->type][0];
 
         const uint64_t total_wg = CEIL_DIV(total_outputs, (uint64_t) WEBGPU_MUL_MAT_WG_SIZE);
@@ -1964,8 +1992,13 @@ static webgpu_command ggml_webgpu_unary_op(webgpu_context & ctx, ggml_tensor * s
                             .size    = ggml_webgpu_tensor_binding_size(ctx, dst) });
     }
 
-    uint32_t wg_x = CEIL_DIV(ne, decisions.wg_size);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(CEIL_DIV((uint64_t) ne, (uint64_t) decisions.wg_size), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: UNARY dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_binary_op(webgpu_context &  ctx,
@@ -2040,8 +2073,14 @@ static webgpu_command ggml_webgpu_binary_op(webgpu_context &  ctx,
                             .size    = ggml_webgpu_tensor_binding_size(ctx, dst) });
     }
 
-    uint32_t wg_x = CEIL_DIV(ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: BIN_OP dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_rms_norm(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
@@ -2199,8 +2238,14 @@ static webgpu_command ggml_webgpu_rope(webgpu_context & ctx,
     }
 
     webgpu_pipeline pipeline = ctx->rope_pipelines[dst->type][has_freq_factor][inplace];
-    uint32_t        wg_x     = CEIL_DIV(ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x);
+    const uint32_t  max_wg   = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t        wg_x     = 0;
+    uint32_t        wg_y     = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: ROPE dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_glu(webgpu_context & ctx, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
@@ -2251,8 +2296,14 @@ static webgpu_command ggml_webgpu_glu(webgpu_context & ctx, ggml_tensor * src0, 
                         .size    = ggml_webgpu_tensor_binding_size(ctx, dst) });
 
     webgpu_pipeline pipeline = ctx->glu_pipelines[ggml_get_glu_op(dst)][dst->type][split];
-    uint32_t        wg_x     = CEIL_DIV(ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
-    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x);
+    const uint32_t  max_wg   = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t        wg_x     = 0;
+    uint32_t        wg_y     = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: GLU dispatch exceeds device workgroup limits");
+    }
+    return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, pipeline, params, entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_scale(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
@@ -2288,9 +2339,15 @@ static webgpu_command ggml_webgpu_scale(webgpu_context & ctx, ggml_tensor * src,
                             .size    = ggml_webgpu_tensor_binding_size(ctx, dst) });
     }
 
-    uint32_t wg_x = CEIL_DIV(ggml_nelements(dst), WEBGPU_MAX_WG_SIZE);
+    const uint32_t max_wg = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+    uint32_t       wg_x   = 0;
+    uint32_t       wg_y   = 1;
+    if (!ggml_webgpu_dispatch_1d_to_2d(
+            CEIL_DIV((uint64_t) ggml_nelements(dst), (uint64_t) WEBGPU_MAX_WG_SIZE), max_wg, wg_x, wg_y)) {
+        GGML_ABORT("ggml_webgpu: SCALE dispatch exceeds device workgroup limits");
+    }
     return ggml_backend_webgpu_build(ctx->global_ctx, ctx->param_buf_pool, ctx->scale_pipelines[inplace], params,
-                                     entries, wg_x);
+                                     entries, wg_x, wg_y);
 }
 
 static webgpu_command ggml_webgpu_soft_max(webgpu_context & ctx,
@@ -4256,10 +4313,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                     break;
                 }
 
-                const uint64_t ne     = (uint64_t) ggml_nelements(op);
-                const uint64_t wg_x   = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
-                const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
-                supports_op            = ne > 0 && ne <= UINT32_MAX && wg_x > 0 && wg_x <= max_wg;
+                const uint64_t ne       = (uint64_t) ggml_nelements(op);
+                const uint64_t total_wg = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+                const uint32_t max_wg   = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+                uint32_t       dispatch_x = 0;
+                uint32_t       dispatch_y = 1;
+                supports_op = ne > 0 && ne <= UINT32_MAX &&
+                              ggml_webgpu_dispatch_1d_to_2d(total_wg, max_wg, dispatch_x, dispatch_y);
                 break;
             }
         case GGML_OP_GROUP_NORM:
@@ -4342,10 +4402,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                     break;
                 }
 
-                const uint64_t ne = (uint64_t) ggml_nelements(op);
-                const uint64_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
-                const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
-                supports_op = ne > 0 && ne <= UINT32_MAX && wg_x > 0 && wg_x <= max_wg;
+                const uint64_t ne       = (uint64_t) ggml_nelements(op);
+                const uint64_t total_wg = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+                const uint32_t max_wg   = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+                uint32_t       dispatch_x = 0;
+                uint32_t       dispatch_y = 1;
+                supports_op = ne > 0 && ne <= UINT32_MAX &&
+                              ggml_webgpu_dispatch_1d_to_2d(total_wg, max_wg, dispatch_x, dispatch_y);
                 break;
             }
         case GGML_OP_UPSCALE:
@@ -4363,10 +4426,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                     break;
                 }
 
-                const uint64_t ne = (uint64_t) ggml_nelements(op);
-                const uint64_t wg_x = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
-                const uint64_t max_wg = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
-                supports_op = ne > 0 && ne <= UINT32_MAX && wg_x > 0 && wg_x <= max_wg;
+                const uint64_t ne       = (uint64_t) ggml_nelements(op);
+                const uint64_t total_wg = CEIL_DIV(ne, WEBGPU_MAX_WG_SIZE);
+                const uint32_t max_wg   = ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+                uint32_t       dispatch_x = 0;
+                uint32_t       dispatch_y = 1;
+                supports_op = ne > 0 && ne <= UINT32_MAX &&
+                              ggml_webgpu_dispatch_1d_to_2d(total_wg, max_wg, dispatch_x, dispatch_y);
                 break;
             }
         case GGML_OP_FLASH_ATTN_EXT:

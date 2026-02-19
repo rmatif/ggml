@@ -62,8 +62,10 @@ var<uniform> params: Params;
 
 override wg_size: u32;
 @compute @workgroup_size(wg_size)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(num_workgroups) num_wg: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let idx = (wg_id.y * num_wg.x + wg_id.x) * wg_size + local_id.x;
     if (idx >= params.ne) {
         return;
     }
