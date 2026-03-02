@@ -70,6 +70,26 @@ static void im2col_cuda(const src_t * x, dst_t* dst,
                                                                                                    s0, s1, p0, p1, d0, d1);
 }
 
+template <typename src_t>
+static void im2col_dispatch_dst(const src_t * src1_d, ggml_tensor * dst,
+    int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
+    int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
+    int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream) {
+    switch (dst->type) {
+        case GGML_TYPE_F16:
+            im2col_cuda<src_t, half>(src1_d, (half *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        case GGML_TYPE_F32:
+            im2col_cuda<src_t, float>(src1_d, (float *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        case GGML_TYPE_BF16:
+            im2col_cuda<src_t, nv_bfloat16>(src1_d, (nv_bfloat16 *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        default:
+            GGML_ABORT("im2col: unsupported dst type");
+    }
+}
+
 void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -102,41 +122,18 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t N        = src1->ne[is_2D ? 3 : 2];
     const int64_t IH_IW    = src1->nb[is_2D ? 3 : 2] / src1_type_size; // nb is byte offset
 
-    if (src1->type == GGML_TYPE_F32) {
-        const float * src1_d = (const float *)src1->data;
-        if (dst->type == GGML_TYPE_F16) {
-            im2col_cuda<float, half>(src1_d, (half *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_F32) {
-            im2col_cuda<float, float>(src1_d, (float *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_BF16) {
-            im2col_cuda<float, nv_bfloat16>(src1_d, (nv_bfloat16 *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else {
-            GGML_ABORT("im2col: unsupported dst type");
-        }
-    } else if (src1->type == GGML_TYPE_F16) {
-        const half * src1_d = (const half *)src1->data;
-        if (dst->type == GGML_TYPE_F16) {
-            im2col_cuda<half, half>(src1_d, (half *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_F32) {
-            im2col_cuda<half, float>(src1_d, (float *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_BF16) {
-            im2col_cuda<half, nv_bfloat16>(src1_d, (nv_bfloat16 *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else {
-            GGML_ABORT("im2col: unsupported dst type");
-        }
-    } else if (src1->type == GGML_TYPE_BF16) {
-        const nv_bfloat16 * src1_d = (const nv_bfloat16 *)src1->data;
-        if (dst->type == GGML_TYPE_F16) {
-            im2col_cuda<nv_bfloat16, half>(src1_d, (half *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_F32) {
-            im2col_cuda<nv_bfloat16, float>(src1_d, (float *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else if (dst->type == GGML_TYPE_BF16) {
-            im2col_cuda<nv_bfloat16, nv_bfloat16>(src1_d, (nv_bfloat16 *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
-        } else {
-            GGML_ABORT("im2col: unsupported dst type");
-        }
-    } else {
-        GGML_ABORT("im2col: unsupported src type");
+    switch (src1->type) {
+        case GGML_TYPE_F32:
+            im2col_dispatch_dst<float>((const float *)src1->data, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        case GGML_TYPE_F16:
+            im2col_dispatch_dst<half>((const half *)src1->data, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        case GGML_TYPE_BF16:
+            im2col_dispatch_dst<nv_bfloat16>((const nv_bfloat16 *)src1->data, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+            return;
+        default:
+            GGML_ABORT("im2col: unsupported src type");
     }
 }
 

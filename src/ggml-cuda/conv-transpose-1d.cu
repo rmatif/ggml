@@ -62,6 +62,38 @@ static void conv_transpose_1d_f32_f32_cuda(
         src0,src1, dst);
 }
 
+template <typename src0_t>
+static void conv_transpose_1d_dispatch_src1(
+        const int s0, const int p0, const int d0, const int output_size,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        const src0_t * src0_d, float * dst_d, cudaStream_t stream) {
+    switch (src1->type) {
+        case GGML_TYPE_F32:
+            conv_transpose_1d_f32_f32_cuda<src0_t, float>(s0, p0, d0, output_size,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                src0_d, (const float *)src1->data, dst_d, stream);
+            return;
+        case GGML_TYPE_F16:
+            conv_transpose_1d_f32_f32_cuda<src0_t, half>(s0, p0, d0, output_size,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                src0_d, (const half *)src1->data, dst_d, stream);
+            return;
+        case GGML_TYPE_BF16:
+            conv_transpose_1d_f32_f32_cuda<src0_t, nv_bfloat16>(s0, p0, d0, output_size,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                src0_d, (const nv_bfloat16 *)src1->data, dst_d, stream);
+            return;
+        default:
+            GGML_ABORT("conv_transpose_1d: unsupported src1 type");
+    }
+}
+
 void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -82,85 +114,17 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const int64_t output_size = ggml_nelements(dst);
 
-    if (src0->type == GGML_TYPE_F32) {
-        const float * src0_d = (const float *)src0->data;
-        if (src1->type == GGML_TYPE_F32) {
-            const float * src1_d = (const float *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<float, float>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_F16) {
-            const half * src1_d = (const half *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<float, half>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            const nv_bfloat16 * src1_d = (const nv_bfloat16 *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<float, nv_bfloat16>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else {
-            GGML_ABORT("conv_transpose_1d: unsupported src1 type");
-        }
-    } else if (src0->type == GGML_TYPE_F16) {
-        const half * src0_d = (const half *)src0->data;
-        if (src1->type == GGML_TYPE_F32) {
-            const float * src1_d = (const float *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<half, float>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_F16) {
-            const half * src1_d = (const half *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<half, half>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            const nv_bfloat16 * src1_d = (const nv_bfloat16 *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<half, nv_bfloat16>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else {
-            GGML_ABORT("conv_transpose_1d: unsupported src1 type");
-        }
-    } else if (src0->type == GGML_TYPE_BF16) {
-        const nv_bfloat16 * src0_d = (const nv_bfloat16 *)src0->data;
-        if (src1->type == GGML_TYPE_F32) {
-            const float * src1_d = (const float *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<nv_bfloat16, float>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_F16) {
-            const half * src1_d = (const half *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<nv_bfloat16, half>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            const nv_bfloat16 * src1_d = (const nv_bfloat16 *)src1->data;
-            conv_transpose_1d_f32_f32_cuda<nv_bfloat16, nv_bfloat16>(s0, p0, d0, output_size,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0_d, src1_d, dst_d, stream);
-        } else {
-            GGML_ABORT("conv_transpose_1d: unsupported src1 type");
-        }
-    } else {
-        GGML_ABORT("conv_transpose_1d: unsupported src0 type");
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            conv_transpose_1d_dispatch_src1<float>(s0, p0, d0, output_size, src0, src1, dst, (const float *)src0->data, dst_d, stream);
+            return;
+        case GGML_TYPE_F16:
+            conv_transpose_1d_dispatch_src1<half>(s0, p0, d0, output_size, src0, src1, dst, (const half *)src0->data, dst_d, stream);
+            return;
+        case GGML_TYPE_BF16:
+            conv_transpose_1d_dispatch_src1<nv_bfloat16>(s0, p0, d0, output_size, src0, src1, dst, (const nv_bfloat16 *)src0->data, dst_d, stream);
+            return;
+        default:
+            GGML_ABORT("conv_transpose_1d: unsupported src0 type");
     }
 }

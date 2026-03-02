@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 static __device__ __forceinline__ float op_repeat(const float a, const float b) {
@@ -356,6 +357,25 @@ struct bin_bcast_cuda {
     }
 };
 
+template <class op, typename src0_t, typename dst_t>
+static inline void ggml_cuda_op_bin_bcast_dispatch_src1(
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+    const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
+    switch (src1->type) {
+        case GGML_TYPE_F32:
+            op()(src0, src1, dst, (const src0_t *)src0_dd, (const float *)src1_dd, (dst_t *)dst_dd, stream);
+            return;
+        case GGML_TYPE_F16:
+            op()(src0, src1, dst, (const src0_t *)src0_dd, (const half *)src1_dd, (dst_t *)dst_dd, stream);
+            return;
+        case GGML_TYPE_BF16:
+            op()(src0, src1, dst, (const src0_t *)src0_dd, (const nv_bfloat16 *)src1_dd, (dst_t *)dst_dd, stream);
+            return;
+        default:
+            GGML_ABORT("bin_bcast: unsupported src1 type");
+    }
+}
+
 template <typename T>
 static void repeat_back_cuda(
     const T * src, T * dst, const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -376,42 +396,22 @@ static void ggml_cuda_op_bin_bcast(
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        if (src1->type == GGML_TYPE_F16) {
-            op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            op()(src0, src1, dst, (const float *)src0_dd, (const nv_bfloat16 *)src1_dd, (float *)dst_dd, stream);
-        } else {
-            op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
-        }
+        ggml_cuda_op_bin_bcast_dispatch_src1<op, float, float>(src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
+        return;
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
-        if (src1->type == GGML_TYPE_F16) {
-            op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            op()(src0, src1, dst, (const half *) src0_dd, (const nv_bfloat16 *)src1_dd, (half *) dst_dd, stream);
-        } else {
-            op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (half *) dst_dd, stream);
-        }
+        ggml_cuda_op_bin_bcast_dispatch_src1<op, half, half>(src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
+        return;
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-        if (src1->type == GGML_TYPE_F16) {
-            op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            op()(src0, src1, dst, (const half *) src0_dd, (const nv_bfloat16 *)src1_dd, (float *)dst_dd, stream);
-        } else {
-            op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
-        }
+        ggml_cuda_op_bin_bcast_dispatch_src1<op, half, float>(src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
+        return;
     } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
-        if (src1->type == GGML_TYPE_F16) {
-            op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const half *)src1_dd, (nv_bfloat16 *)dst_dd, stream);
-        } else if (src1->type == GGML_TYPE_BF16) {
-            op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *)src1_dd, (nv_bfloat16 *)dst_dd, stream);
-        } else {
-            op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *)src1_dd, (nv_bfloat16 *)dst_dd, stream);
-        }
-    } else {
-        fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
-            ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
-        GGML_ABORT("fatal error");
+        ggml_cuda_op_bin_bcast_dispatch_src1<op, nv_bfloat16, nv_bfloat16>(src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
+        return;
     }
+
+    fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
+        ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
+    GGML_ABORT("fatal error");
 }
 
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -441,63 +441,42 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    auto dispatch_src1 = [&](auto src0_ptr, auto dst_ptr) {
+        using src0_t = std::remove_pointer_t<decltype(src0_ptr)>;
+        using dst_t  = std::remove_pointer_t<decltype(dst_ptr)>;
+        switch (src1->type) {
+            case GGML_TYPE_F32:
+                launch_bin_bcast_pack<op, src0_t, float, dst_t>(src0, src1, dst,
+                    src0_ptr, (const float *) src1->data, dst_ptr,
+                    stream, std::make_index_sequence<n_fuse>{});
+                return true;
+            case GGML_TYPE_F16:
+                launch_bin_bcast_pack<op, src0_t, half, dst_t>(src0, src1, dst,
+                    src0_ptr, (const half *) src1->data, dst_ptr,
+                    stream, std::make_index_sequence<n_fuse>{});
+                return true;
+            case GGML_TYPE_BF16:
+                launch_bin_bcast_pack<op, src0_t, nv_bfloat16, dst_t>(src0, src1, dst,
+                    src0_ptr, (const nv_bfloat16 *) src1->data, dst_ptr,
+                    stream, std::make_index_sequence<n_fuse>{});
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    bool ok = false;
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        if (src1->type == GGML_TYPE_F16) {
-            launch_bin_bcast_pack<op, float, half, float>(src0, src1, dst,
-                (const float *) src0->data, (const half *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else if (src1->type == GGML_TYPE_BF16) {
-            launch_bin_bcast_pack<op, float, nv_bfloat16, float>(src0, src1, dst,
-                (const float *) src0->data, (const nv_bfloat16 *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else {
-            launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
-                (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        }
+        ok = dispatch_src1((const float *) src0->data, (float *) dst->data);
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
-        if (src1->type == GGML_TYPE_F16) {
-            launch_bin_bcast_pack<op, half, half, half>(src0, src1, dst,
-                (const half *) src0->data, (const half *) src1->data, (half *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else if (src1->type == GGML_TYPE_BF16) {
-            launch_bin_bcast_pack<op, half, nv_bfloat16, half>(src0, src1, dst,
-                (const half *) src0->data, (const nv_bfloat16 *) src1->data, (half *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else {
-            launch_bin_bcast_pack<op, half, float, half>(src0, src1, dst,
-                (const half *) src0->data, (const float *) src1->data, (half *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        }
+        ok = dispatch_src1((const half *) src0->data, (half *) dst->data);
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-        if (src1->type == GGML_TYPE_F16) {
-            launch_bin_bcast_pack<op, half, half, float>(src0, src1, dst,
-                (const half *) src0->data, (const half *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else if (src1->type == GGML_TYPE_BF16) {
-            launch_bin_bcast_pack<op, half, nv_bfloat16, float>(src0, src1, dst,
-                (const half *) src0->data, (const nv_bfloat16 *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else {
-            launch_bin_bcast_pack<op, half, float, float>(src0, src1, dst,
-                (const half *) src0->data, (const float *) src1->data, (float *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        }
+        ok = dispatch_src1((const half *) src0->data, (float *) dst->data);
     } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
-        if (src1->type == GGML_TYPE_F16) {
-            launch_bin_bcast_pack<op, nv_bfloat16, half, nv_bfloat16>(src0, src1, dst,
-                (const nv_bfloat16 *) src0->data, (const half *) src1->data, (nv_bfloat16 *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else if (src1->type == GGML_TYPE_BF16) {
-            launch_bin_bcast_pack<op, nv_bfloat16, nv_bfloat16, nv_bfloat16>(src0, src1, dst,
-                (const nv_bfloat16 *) src0->data, (const nv_bfloat16 *) src1->data, (nv_bfloat16 *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        } else {
-            launch_bin_bcast_pack<op, nv_bfloat16, float, nv_bfloat16>(src0, src1, dst,
-                (const nv_bfloat16 *) src0->data, (const float *) src1->data, (nv_bfloat16 *) dst->data,
-                stream, std::make_index_sequence<n_fuse>{});
-        }
-    } else {
+        ok = dispatch_src1((const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data);
+    }
+
+    if (!ok) {
         fprintf(stderr,
                 "%s: unsupported types for fusion: dst: %s, src0: %s, src1: %s\n",
                 __func__, ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
