@@ -2675,8 +2675,12 @@ static void ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tens
     const fe::DataType_t y_data_type = convert_output_to_fp32 ? fe::DataType_t::HALF : ggml_type_to_fe_type(dst->type);
     const fe::DataType_t compute_data_type = fe::DataType_t::HALF;
 
+    const bool kernel_is_nhwc = (kernel->layout & GGML_TENSOR_LAYOUT_NHWC) != 0;
+
     const std::array<int64_t, 4> x_dims = { (int64_t)src->ne[3], (int64_t)src->ne[2], (int64_t)src->ne[1], (int64_t)src->ne[0] };
-    const std::array<int64_t, 4> w_dims = { (int64_t)kernel->ne[3], (int64_t)kernel->ne[2], (int64_t)kernel->ne[1], (int64_t)kernel->ne[0] };
+    const std::array<int64_t, 4> w_dims = kernel_is_nhwc
+        ? std::array<int64_t, 4>{ (int64_t)kernel->ne[3], (int64_t)kernel->ne[0], (int64_t)kernel->ne[2], (int64_t)kernel->ne[1] }
+        : std::array<int64_t, 4>{ (int64_t)kernel->ne[3], (int64_t)kernel->ne[2], (int64_t)kernel->ne[1], (int64_t)kernel->ne[0] };
     const std::array<int64_t, 4> y_dims = { (int64_t)dst->ne[3], (int64_t)dst->ne[2], (int64_t)dst->ne[1], (int64_t)dst->ne[0] };
 
     auto default_nchw_strides = [](const std::array<int64_t, 4> & dims) {
@@ -2701,7 +2705,14 @@ static void ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tens
                                                              : strides_from_tensor(src, ggml_type_size(src->type));
     const std::array<int64_t, 4> y_strides = convert_output_to_fp32 ? default_nchw_strides(y_dims)
                                                                     : strides_from_tensor(dst, ggml_type_size(dst->type));
-    const std::array<int64_t, 4> w_strides = strides_from_tensor(kernel, ggml_type_size(kernel->type));
+    const std::array<int64_t, 4> w_strides = kernel_is_nhwc
+        ? std::array<int64_t, 4> {
+            (int64_t)(kernel->nb[3] / ggml_type_size(kernel->type)),
+            (int64_t)(kernel->nb[0] / ggml_type_size(kernel->type)),
+            (int64_t)(kernel->nb[2] / ggml_type_size(kernel->type)),
+            (int64_t)(kernel->nb[1] / ggml_type_size(kernel->type)),
+        }
+        : strides_from_tensor(kernel, ggml_type_size(kernel->type));
 
     struct ggml_cudnn_conv2d_key {
         std::array<int64_t, 4> x_dims;
@@ -2989,6 +3000,27 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 #define V_UID 3
 #define O_UID 4
 
+static bool ggml_cuda_can_use_conv2d_cudnn(const ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * src    = dst->src[1];
+
+    if (kernel == nullptr || src == nullptr) {
+        return false;
+    }
+
+    if (kernel->type == GGML_TYPE_F16) {
+        const bool supported_src = src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_F32;
+        const bool supported_dst = dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32;
+        return supported_src && supported_dst;
+    }
+
+    if (kernel->type == GGML_TYPE_F32) {
+        return src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    }
+
+    return false;
+}
+
 static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
                                            ggml_tensor * dst,
                                            bool is_causal) {
@@ -3003,7 +3035,7 @@ static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
         return false;
     }
 
-    GGML_LOG_INFO("%s: using cuDNN flash attention\n", __func__);
+    // GGML_LOG_INFO("%s: using cuDNN flash attention\n", __func__);
 
     // --- Inputs ---
     const ggml_tensor * q = dst->src[0];
@@ -3068,7 +3100,8 @@ static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
     }
 
     // Output layout: make O contiguous in (d, h, s, b) order so we can
-    // convert FP16->FP32 directly into dst, which already uses that layout.
+    // write or convert from the cuDNN output without any layout transform.
+    GGML_ASSERT(ggml_is_contiguous(dst));
     const int64_t o_stride_d = 1;
     const int64_t o_stride_h = d_v;
     const int64_t o_stride_s = h_q * d_v;
@@ -3234,8 +3267,9 @@ static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
     }
 
     // --- Execute ---
-    ggml_cuda_pool_alloc<half>   dst_f16_pool(ctx.pool());
-    void * o_ptr = dst_f16_pool.alloc(ggml_nelements(dst));  // O is FP16
+    ggml_cuda_pool_alloc<half> dst_f16_pool(ctx.pool());
+    const bool write_dst_f16_direct = dst->type == GGML_TYPE_F16;
+    void * o_ptr = write_dst_f16_direct ? dst->data : dst_f16_pool.alloc(ggml_nelements(dst));
 
     std::unordered_map<int64_t, void*> variant_pack = {
         {Q_UID, q_ptr}, {K_UID, k_ptr}, {V_UID, v_ptr}, {O_UID, o_ptr}
@@ -3249,9 +3283,18 @@ static bool ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx,
         return false;
     }
 
-    // Convert O (FP16, in (d,h,s,b) layout) -> dst (FP32, same layout)
-    const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-    to_fp32_cuda((const half *)o_ptr, (float *)dst->data, ggml_nelements(dst), stream);
+    if (!write_dst_f16_direct) {
+        if (dst->type == GGML_TYPE_F32) {
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            to_fp32_cuda((const half *)o_ptr, (float *)dst->data, ggml_nelements(dst), stream);
+        } else if (dst->type == GGML_TYPE_BF16) {
+            const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(GGML_TYPE_F16);
+            GGML_ASSERT(to_bf16_cuda != nullptr);
+            to_bf16_cuda((const half *)o_ptr, (nv_bfloat16 *)dst->data, ggml_nelements(dst), stream);
+        } else {
+            GGML_ABORT("unsupported cuDNN flash attention output type");
+        }
+    }
 
     // Ensure all queued work is done before the pooled temporaries go out of scope.
     // This prevents reuse of Q/K/V/O/workspace buffers while kernels are still in flight.
@@ -3520,6 +3563,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_im2col_3d(ctx, dst);
             break;
         case GGML_OP_CONV_2D:
+#if defined(GGML_USE_CUDNN)
+            if (getenv("GGML_USE_CONV2D_CUDNN") != nullptr && ggml_cuda_can_use_conv2d_cudnn(dst)) {
+                ggml_cuda_op_conv2d_cudnn(ctx, dst);
+                break;
+            }
+#endif // GGML_USE_CUDNN
             ggml_cuda_op_conv2d_implicit(ctx, dst, nullptr);
             break;
         case GGML_OP_CONV_3D:
@@ -4888,7 +4937,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
-                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONV_2D, GGML_OP_RESHAPE, GGML_OP_ADD}, {})) {
+                    bool prefer_cudnn_conv2d = false;
+#if defined(GGML_USE_CUDNN)
+                    prefer_cudnn_conv2d = getenv("GGML_USE_CONV2D_CUDNN") != nullptr && ggml_cuda_can_use_conv2d_cudnn(node);
+#endif // GGML_USE_CUDNN
+                    if (!prefer_cudnn_conv2d && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONV_2D, GGML_OP_RESHAPE, GGML_OP_ADD}, {})) {
                         ggml_cuda_op_conv2d_implicit(*cuda_ctx, node, cgraph->nodes[i+2]);
                         i += 2;
                         continue;
