@@ -640,6 +640,11 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
     };
 
+    enum ggml_tensor_layout {
+        GGML_TENSOR_LAYOUT_NCHW = 0, // default layout
+        GGML_TENSOR_LAYOUT_NHWC = 1, // used by conv2d
+    };
+
     enum ggml_tri_type {
         GGML_TRI_TYPE_UPPER_DIAG = 0,
         GGML_TRI_TYPE_UPPER      = 1,
@@ -673,6 +678,7 @@ extern "C" {
         int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
 
         int32_t flags;
+        int32_t layout;
 
         struct ggml_tensor * src[GGML_MAX_SRC];
 
@@ -686,7 +692,7 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        char padding[12];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -863,6 +869,7 @@ extern "C" {
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
+    GGML_API void ggml_set_NHWC_layout(struct ggml_tensor * tensor);
 
     //
     // operations on tensors with backpropagation

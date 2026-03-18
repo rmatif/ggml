@@ -1751,6 +1751,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.op           =*/ GGML_OP_NONE,
         /*.op_params    =*/ { 0 },
         /*.flags        =*/ 0,
+        /*.layout       =*/ 0,
         /*.src          =*/ { NULL },
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
@@ -4753,12 +4754,21 @@ struct ggml_tensor * ggml_conv_2d_direct(
         int                   d0,  // dilation dimension 0
         int                   d1) {// dilation dimension 1
 
-    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    if (a->layout & GGML_TENSOR_LAYOUT_NHWC) {
+        GGML_ASSERT(a->ne[0] == b->ne[2]);
+    } else {
+        GGML_ASSERT(a->ne[2] == b->ne[2]);
+    }
     //GGML_ASSERT(a->type == b->type);
 
     int64_t ne[4];
-    ne[0] = ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0);
-    ne[1] = ggml_calc_conv_output_size(b->ne[1], a->ne[1], s1, p1, d1);
+    if (a->layout & GGML_TENSOR_LAYOUT_NHWC) {
+        ne[0] = ggml_calc_conv_output_size(b->ne[0], a->ne[1], s0, p0, d0);
+        ne[1] = ggml_calc_conv_output_size(b->ne[1], a->ne[2], s1, p1, d1);
+    } else {
+        ne[0] = ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0);
+        ne[1] = ggml_calc_conv_output_size(b->ne[1], a->ne[1], s1, p1, d1);
+    }
     ne[2] = a->ne[3];
     ne[3] = b->ne[3];
 
@@ -7581,6 +7591,10 @@ void ggml_set_loss(struct ggml_tensor * tensor) {
     GGML_ASSERT(ggml_is_scalar(tensor));
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
     tensor->flags |= GGML_TENSOR_FLAG_LOSS;
+}
+
+void ggml_set_NHWC_layout(struct ggml_tensor * tensor) {
+    tensor->layout |= GGML_TENSOR_LAYOUT_NHWC;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

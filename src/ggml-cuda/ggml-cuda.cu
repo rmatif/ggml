@@ -64,6 +64,8 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+void ggml_cuda_op_conv2d_implicit(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * bias);
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3275,14 +3277,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_im2col_3d(ctx, dst);
             break;
         case GGML_OP_CONV_2D:
-            {
-                static const bool use_cudnn = (getenv("GGML_USE_CONV2D_CUDNN") != nullptr);
-                if (use_cudnn) {
-                    ggml_cuda_op_conv2d_cudnn(ctx, dst);
-                } else {
-                    ggml_cuda_op_conv2d(ctx, dst);
-                }
-            }
+            ggml_cuda_op_conv2d_implicit(ctx, dst, nullptr);
             break;
         case GGML_OP_CONV_3D:
             ggml_cuda_op_conv3d_implicit(ctx, dst);
@@ -3933,6 +3928,47 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_RESHAPE &&
+        ops.begin()[2] == GGML_OP_MUL && ops.begin()[3] == GGML_OP_RESHAPE && ops.begin()[4] == GGML_OP_ADD) {
+        const ggml_tensor * group_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul        = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * add        = cgraph->nodes[node_idx + 4];
+
+        if (group_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], group_norm)) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1])) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        const ggml_tensor * norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+
+        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1])) {
+            return false;
+        }
+
+        return true;
+    }
+
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
@@ -3940,22 +3976,6 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
             add = cgraph->nodes[node_idx+2];
-        }
-
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
-
-        //rms norm only supports F32
-        if (mul->src[0]->type != GGML_TYPE_F32 ||
-            mul->src[1]->type != GGML_TYPE_F32 ||
-            mul->type != GGML_TYPE_F32) {
-            return false;
-        }
-
-        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
-            add->src[1]->type != GGML_TYPE_F32 ||
-            add->type != GGML_TYPE_F32) ) {
-            return false;
         }
 
         //if rms norm is the B operand, then we don't handle broadcast
@@ -4562,9 +4582,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD }, {})) {
+                        ggml_cuda_op_group_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+2], cgraph->nodes[i+4]);
+                        i += 4;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
+                        ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
+                        continue;
+                    }
+
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
                         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONV_2D, GGML_OP_RESHAPE, GGML_OP_ADD}, {})) {
+                        ggml_cuda_op_conv2d_implicit(*cuda_ctx, node, cgraph->nodes[i+2]);
+                        i += 2;
                         continue;
                     }
 
@@ -5597,46 +5635,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_POOL_2D:
             return true;
         case GGML_OP_CONV_2D:
-            {
-                static const bool use_cudnn = (getenv("GGML_USE_CONV2D_CUDNN") != nullptr);
-                if (!use_cudnn) {
-                    return true;
-                }
-
-                const ggml_tensor * kernel = op->src[0];
-                const ggml_tensor * src = op->src[1];
-
-                if (src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
-                    return false;
-                }
-
-                if (kernel->type != GGML_TYPE_F32 && kernel->type != GGML_TYPE_F16) {
-                    return false;
-                }
-
-                if (!ggml_is_contiguous(src) || !ggml_is_contiguous(kernel)) {
-                    return false;
-                }
-
-                const int P0 = ggml_get_op_params_i32(op, 2);
-                const int P1 = ggml_get_op_params_i32(op, 3);
-                const int D0 = ggml_get_op_params_i32(op, 4);
-                const int D1 = ggml_get_op_params_i32(op, 5);
-
-                const int64_t W = src->ne[0];
-                const int64_t H = src->ne[1];
-                const int64_t KW = kernel->ne[0];
-                const int64_t KH = kernel->ne[1];
-
-                if (W + 2LL * P0 < (long long) D0 * (KW - 1) + 1) {
-                    return false;
-                }
-                if (H + 2LL * P1 < (long long) D1 * (KH - 1) + 1) {
-                    return false;
-                }
-
-                return true;
-            }
+            return true;
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
