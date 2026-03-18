@@ -1334,6 +1334,9 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    const void * last_graph_key  = nullptr;
+    const void * fixed_graph_key = nullptr;
+    bool same_future_graph       = false;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         auto it = cuda_graphs.find(first_node_ptr);

@@ -3599,14 +3599,17 @@ static bool ggml_cuda_graph_node_properties_match(ggml_tensor * node, ggml_cuda_
     return true;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    if (cuda_ctx->same_future_graph && cuda_ctx->fixed_graph_key != nullptr) {
+        return cuda_ctx->fixed_graph_key;
+    }
     return cgraph->nodes[0];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     // Check if the graph size has changed
@@ -4664,6 +4667,28 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+void ggml_backend_cuda_fix_graph(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->same_future_graph = true;
+    if (cuda_ctx->last_graph_key != nullptr) {
+        cuda_ctx->fixed_graph_key = cuda_ctx->last_graph_key;
+    }
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
+void ggml_backend_cuda_unfix_graph(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->same_future_graph = false;
+    cuda_ctx->fixed_graph_key   = nullptr;
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4674,7 +4699,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
+    cuda_ctx->last_graph_key = graph_key;
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -4752,7 +4778,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;

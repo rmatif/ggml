@@ -647,25 +647,41 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    ggml_cuda_pool_alloc<float> x_bias_f32_alloc(ctx.pool());
+    ggml_cuda_pool_alloc<float> gate_bias_f32_alloc(ctx.pool());
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         if (fusion->x_bias) {
-            GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
-            fusion_local.x_bias = fusion->x_bias->data;
+            if (fusion->x_bias->type == GGML_TYPE_F32) {
+                fusion_local.x_bias = fusion->x_bias->data;
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(fusion->x_bias->type);
+                GGML_ASSERT(to_fp32_cuda != nullptr);
+                x_bias_f32_alloc.alloc(ggml_nelements(fusion->x_bias));
+                to_fp32_cuda(fusion->x_bias->data, x_bias_f32_alloc.get(), ggml_nelements(fusion->x_bias), ctx.stream());
+                fusion_local.x_bias = x_bias_f32_alloc.get();
+            }
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
-            GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
-            fusion_local.gate_bias = fusion->gate_bias->data;
+            if (fusion->gate_bias->type == GGML_TYPE_F32) {
+                fusion_local.gate_bias = fusion->gate_bias->data;
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(fusion->gate_bias->type);
+                GGML_ASSERT(to_fp32_cuda != nullptr);
+                gate_bias_f32_alloc.alloc(ggml_nelements(fusion->gate_bias));
+                to_fp32_cuda(fusion->gate_bias->data, gate_bias_f32_alloc.get(), ggml_nelements(fusion->gate_bias), ctx.stream());
+                fusion_local.gate_bias = gate_bias_f32_alloc.get();
+            }
         }
         fusion_local.glu_op = fusion->glu_op;
     }
