@@ -35,6 +35,7 @@
 #include "vendors/musa.h"
 #else
 #include "vendors/cuda.h"
+#include <cublasLt.h>
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 
@@ -1326,6 +1327,7 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    cublasLtHandle_t cublasLt_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
     cudnnHandle_t  cudnn_handles[GGML_CUDA_MAX_DEVICES]  = {nullptr};
 
     int curr_stream_no = 0;
@@ -1401,6 +1403,18 @@ struct ggml_backend_cuda_context {
 
     cublasHandle_t cublas_handle() {
         return cublas_handle(device);
+    }
+
+    cublasLtHandle_t cublasLt_handle(int device) {
+        if (cublasLt_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasLtCreate(&cublasLt_handles[device]));
+        }
+        return cublasLt_handles[device];
+    }
+
+    cublasLtHandle_t cublasLt_handle() {
+        return cublasLt_handle(device);
     }
 
     // pool

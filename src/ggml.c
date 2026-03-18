@@ -3222,7 +3222,11 @@ struct ggml_tensor * ggml_mul_mat(
     GGML_ASSERT(!ggml_is_transposed(a));
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    enum ggml_type type = GGML_TYPE_F32;
+    if (b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_BF16) {
+        type = b->type;
+    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, type, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
