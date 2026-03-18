@@ -24,11 +24,21 @@ endif()
 # --- End Manual cuDNN Find ---
 
 # --- Find cuDNN Frontend ---
+set(CUDNN_FRONTEND_ROOT "/home/user/Dev/bleeding_edge/cudnn-frontend" CACHE PATH
+    "Path to the cuDNN frontend checkout")
+
 find_path(CUDNN_FRONTEND_INCLUDE_DIR cudnn_frontend.h
-          HINTS /work/cudnn-frontend/include)
+          HINTS
+              "${CUDNN_FRONTEND_INCLUDE_DIR}"
+              "${CUDNN_FRONTEND_ROOT}/include"
+              "$ENV{CUDNN_FRONTEND_INCLUDE_DIR}"
+              "$ENV{CUDNN_FRONTEND_ROOT}/include"
+              /home/user/Dev/bleeding_edge/cudnn-frontend/include
+              /work/cudnn-frontend/include)
 
 if(NOT CUDNN_FRONTEND_INCLUDE_DIR)
-    message(FATAL_ERROR "Could not find cudnn_frontend.h. Please ensure cuDNN Frontend is installed in /work/cudnn-frontend or specify its include directory.")
+    message(FATAL_ERROR
+        "Could not find cudnn_frontend.h. Set CUDNN_FRONTEND_ROOT or CUDNN_FRONTEND_INCLUDE_DIR to your cuDNN frontend checkout.")
 else()
     message(STATUS "Found cuDNN Frontend headers in: ${CUDNN_FRONTEND_INCLUDE_DIR}")
 endif()
@@ -194,22 +204,22 @@ if (CUDAToolkit_FOUND)
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas ${CUDNN_LIBRARIES})
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::nvrtc ${CUDNN_LIBRARIES})
         else ()
             if (GGML_CUDA_CUB_3DOT2)
                 target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
             endif()
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1")
-                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static CUDA::nvrtc ${CUDNN_LIBRARIES})
             else()
-                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static ${CUDNN_LIBRARIES})
+                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::nvrtc ${CUDNN_LIBRARIES})
             endif()
         endif()
     else()
         if (GGML_CUDA_CUB_3DOT2)
             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
         endif()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas ${CUDNN_LIBRARIES})
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::nvrtc ${CUDNN_LIBRARIES})
     endif()
 
     if (GGML_CUDA_NO_VMM)
