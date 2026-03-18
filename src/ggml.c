@@ -5332,9 +5332,14 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask);
     }
 
+    enum ggml_type result_type = GGML_TYPE_F32;
+    if (q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_BF16) {
+        result_type = q->type;
+    }
+
     // permute(0, 2, 1, 3)
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, result_type, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
