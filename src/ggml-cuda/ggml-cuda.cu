@@ -1402,10 +1402,12 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
-template<ggml_type compute_type>
+template<ggml_type compute_type, bool f16_accumulate_f32 = false>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
+
+    static_assert(!f16_accumulate_f32 || compute_type == GGML_TYPE_F16);
 
     GGML_ASSERT(ggml_is_contiguous(dst));
 
@@ -1511,7 +1513,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
-    if (prefer_f32_output) {
+    if constexpr (f16_accumulate_f32) {
+        // Preserve F16 tensor-core operands while matching frameworks that use
+        // FP32 accumulation and an FP32 GEMM result. Converting both operands to
+        // F32 and calling SGEMM is numerically and computationally different.
+        dst_ptr = (char *) dst_ddf;
+        cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
+        cu_data_type = batched_mul_mat_traits<GGML_TYPE_F32>::data_type;
+        alpha = batched_mul_mat_traits<GGML_TYPE_F32>::get_alpha();
+        beta = batched_mul_mat_traits<GGML_TYPE_F32>::get_beta();
+    } else if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
         cu_data_type = batched_mul_mat_traits<GGML_TYPE_F32>::data_type;
@@ -1618,12 +1629,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_type compute_type = src0->type;
+    bool f16_accumulate_f32 = src0->type == GGML_TYPE_F16 && dst->op_params[0] == GGML_PREC_F32;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
-    if (dst->op_params[0] == GGML_PREC_F32) {
+    if (dst->op_params[0] == GGML_PREC_F32 && !f16_accumulate_f32) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -1635,10 +1647,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
         if (env_cpp == "f32" || env_cpp == "fp32") {
             compute_type = GGML_TYPE_F32;
+            f16_accumulate_f32 = false;
         } else if (env_cpp == "f16" || env_cpp == "fp16") {
             compute_type = GGML_TYPE_F16;
+            f16_accumulate_f32 = false;
         } else if (env_cpp == "bf16") {
             compute_type = GGML_TYPE_BF16;
+            f16_accumulate_f32 = false;
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
@@ -1652,7 +1667,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
             break;
         case GGML_TYPE_F16:
-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
+            if (f16_accumulate_f32) {
+                ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16, true>(ctx, src0, src1, dst);
+            } else {
+                ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
+            }
             break;
         default:
             GGML_ABORT("fatal error");
